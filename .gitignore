@@ -1,0 +1,9 @@
+runtime/*
+!runtime/.gitkeep
+__pycache__/
+*.pyc
+models/models.tsv
+apps.d/*.app
+!apps.d/*.app.example
+systemd/hanare-comfyui.service
+docs/tasks/

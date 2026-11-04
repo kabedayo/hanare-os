@@ -1,0 +1,5 @@
+name=Example Story App
+exec=/path/to/your-app/run.sh
+workdir=/path/to/your-app
+url=http://127.0.0.1:8765/
+note=Copy to story-studio.app and edit the paths to your app

@@ -1,0 +1,14 @@
+# NOTE: the paths below must match the checkout location of this repo.
+[Unit]
+Description=HANARE read-only dashboard (127.0.0.1:8790)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/hanare-os
+ExecStart=/usr/bin/python3 %h/hanare-os/dashboard/dashboard.py
+Restart=on-failure
+RestartSec=3s
+
+[Install]
+WantedBy=default.target

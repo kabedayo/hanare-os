@@ -1,0 +1,13 @@
+# NOTE: the paths below must match the checkout location of this repo.
+[Unit]
+Description=HANARE llama core (llama-server + effort-proxy)
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/bash %h/hanare-os/scripts/hanare-llama-run.sh
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=30
+
+# No [Install] section on purpose: migration from the manual launcher
+# (start-qwen38-agent.sh) is manual; see docs/migration-llama.md.

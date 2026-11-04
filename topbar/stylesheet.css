@@ -1,0 +1,21 @@
+.vram-ram-label {
+    font-family: monospace;
+    font-size: 9pt;
+    padding: 0 6px;
+}
+
+.hanare-label {
+    font-size: 9pt;
+    font-weight: bold;
+    letter-spacing: 2px;
+    padding: 0 2px;
+}
+
+.hanare-dot {
+    font-size: 9pt;
+    padding: 0 4px;
+}
+
+.hanare-box {
+    spacing: 6px;
+}

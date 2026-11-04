@@ -1,0 +1,20 @@
+# HANARE ComfyUI unit - EXAMPLE.
+# Copy this file to systemd/hanare-comfyui.service, replace the /path/to
+# placeholders with your ComfyUI checkout, then run setup/13-install-services.sh.
+# The real unit stays git-ignored: your install paths are local configuration.
+[Unit]
+Description=HANARE ComfyUI (on demand)
+After=network.target
+
+[Service]
+WorkingDirectory=/path/to/ComfyUI
+ExecStartPre=/usr/bin/mkdir -p %h/hanare-os/runtime/logs
+ExecStartPre=/usr/bin/bash -c 'if ! test -d /path/to/ComfyUI/output || ! test -w /path/to/ComfyUI/output; then echo "hanare-comfyui: output directory missing or not writable: /path/to/ComfyUI/output" >&2; exit 1; fi'
+ExecStart=/path/to/ComfyUI/venv/bin/python main.py --cuda-device 0 --listen 127.0.0.1 --port 8188 --output-directory /path/to/ComfyUI/output --cache-ram 4 8
+StandardOutput=append:%h/hanare-os/runtime/logs/comfyui.log
+StandardError=append:%h/hanare-os/runtime/logs/comfyui.log
+Restart=on-failure
+RestartSec=5s
+
+# No [Install] section on purpose: this unit is started on demand
+# (systemctl --user start hanare-comfyui), not at login.

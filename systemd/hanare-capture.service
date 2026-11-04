@@ -1,0 +1,9 @@
+# NOTE: the paths below must match the checkout location of this repo.
+[Unit]
+Description=HANARE status capture (one pass)
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/hanare-os
+ExecStart=/usr/bin/bash %h/hanare-os/feed/capture.sh

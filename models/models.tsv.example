@@ -1,0 +1,4 @@
+name	gguf_path	mmproj_path	ctx	profile	note	draft_path
+my-llm	/path/to/models/my-llm.gguf	-	32768	generic	Example entry. Copy this file to models.tsv and point it at your GGUF.	-
+my-vision-llm	/path/to/models/vision-llm.gguf	/path/to/models/mmproj.gguf	65536	generic	Example with a vision projector (mmproj).	-
+my-gemma	/path/to/models/gemma.gguf	/path/to/models/gemma-mmproj.gguf	65536	gemma	Gemma-style entry: profile gemma uses an external MTP draft model.	/path/to/models/mtp-draft.gguf

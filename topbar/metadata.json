@@ -1,0 +1,1 @@
+{"description":"Shows NVIDIA VRAM (per GPU) and system RAM usage in the GNOME top bar. + HANARE status","name":"VRAM/RAM Monitor","shell-version":["46"],"uuid":"vram-ram-monitor@kabe.local","version":3}
