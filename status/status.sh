@@ -33,7 +33,12 @@ TIMESTAMP="$(date +%Y-%m-%dT%H:%M:%S%z)"
 # ---- 1. GPUs -----------------------------------------------------------
 GPU_OK=1
 gpu_lines=""
-if gpu_out="$(nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null)"; then
+if ! command -v nvidia-smi >/dev/null 2>&1; then
+  # No NVIDIA tooling on this machine: an empty GPU list is the correct
+  # report, not a collection failure. (A present-but-failing nvidia-smi
+  # still sets GPU_OK=0 below.)
+  gpu_lines=""
+elif gpu_out="$(nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null)"; then
   gpu_lines="$gpu_out"
 else
   GPU_OK=0
