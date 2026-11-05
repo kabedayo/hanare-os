@@ -2,7 +2,7 @@
 # HANARE service helper: operations on the managed services that systemd
 # alone cannot cover.
 #
-#   hanare-service.sh stop-external <llama-server|comfyui>
+#   hanare-service.sh stop-external <llama-server|comfyui|strata>
 #
 # Stops a process that listens on a managed service's port but is NOT
 # managed by the service's systemd user unit (for example a llama-server
@@ -32,7 +32,7 @@ cmd="${1:-}"
 service="${2:-}"
 
 if [ "$cmd" != "stop-external" ] || [ -z "$service" ]; then
-  echo "usage: hanare-service.sh stop-external <llama-server|comfyui>" >&2
+  echo "usage: hanare-service.sh stop-external <llama-server|comfyui|strata>" >&2
   exit 2
 fi
 
@@ -48,6 +48,12 @@ case "$service" in
   comfyui)
     probes=("REG:main.py")
     default_port=8188
+    ;;
+  strata)
+    # Strata serves its registered port from the python server process
+    # (serve/server.py); the GPU engine is its child and exits with it.
+    probes=("REG:serve/server.py")
+    default_port=8095
     ;;
   *)
     echo "hanare-service: unknown service: $service" >&2

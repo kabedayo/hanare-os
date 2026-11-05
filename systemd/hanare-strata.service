@@ -1,0 +1,13 @@
+# NOTE: the paths below must match the checkout location of this repo.
+[Unit]
+Description=HANARE Strata (FlashNext LLM server, 127.0.0.1:8095)
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/bash %h/hanare-os/scripts/hanare-strata-run.sh
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=60
+
+# No [Install] section on purpose: started/stopped on demand from the
+# HANARE UIs, like hanare-llama; see setup/13-install-services.sh.

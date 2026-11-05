@@ -31,11 +31,13 @@ const HANARE_COLOR_INACTIVE = '#8a8a8a';
 const HANARE_SERVICE_UNITS = {
     comfyui: 'hanare-comfyui',
     'llama-server': 'hanare-llama',
+    strata: 'hanare-strata',
 };
 
 const HANARE_SERVICE_DISPLAY = {
     comfyui: 'ComfyUI',
     'llama-server': 'llama',
+    strata: 'Strata',
 };
 
 function hanareFallbackModel() {
@@ -526,6 +528,10 @@ export default class VramRamMonitorExtension extends Extension {
             }
         }
 
+        const agentItem = new PopupMenu.PopupMenuItem('Strata Agent を開く');
+        agentItem.connect('activate', () => this._openStrataAgent());
+        menu.addMenuItem(agentItem);
+        this._hanareMenuItems.push(agentItem);
         const panelItem = new PopupMenu.PopupMenuItem('パネルを開く');
         panelItem.connect('activate', () => this._openPanel());
         menu.addMenuItem(panelItem);
@@ -587,6 +593,16 @@ export default class VramRamMonitorExtension extends Extension {
                 Gio.SubprocessFlags.NONE);
         } catch (e) {
             logError(e, 'HANARE status: failed to launch panel');
+        }
+    }
+
+    _openStrataAgent() {
+        try {
+            Gio.Subprocess.new(
+                ['/bin/sh', GLib.build_filenamev([GLib.get_home_dir(), 'hanare-apps', 'strata-agent', 'run.sh'])],
+                Gio.SubprocessFlags.NONE);
+        } catch (e) {
+            logError(e, 'HANARE status: failed to launch Strata Agent');
         }
     }
 

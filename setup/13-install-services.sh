@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install the hanare-comfyui and hanare-llama systemd user units.
+# Install the hanare-comfyui, hanare-llama and hanare-strata systemd user units.
 # Idempotent: safe to run multiple times. Nothing is auto-started.
 set -eu
 
@@ -18,16 +18,20 @@ else
   echo "      to set up the ComfyUI unit."
 fi
 cp "$REPO_ROOT/systemd/hanare-llama.service" "$UNIT_DIR/hanare-llama.service"
+cp "$REPO_ROOT/systemd/hanare-strata.service" "$UNIT_DIR/hanare-strata.service"
 systemctl --user daemon-reload
 
 echo "Installed user units:"
 [ -f "$UNIT_DIR/hanare-comfyui.service" ] && echo "  $UNIT_DIR/hanare-comfyui.service"
 echo "  $UNIT_DIR/hanare-llama.service"
+echo "  $UNIT_DIR/hanare-strata.service"
 echo
 echo "Status:"
 systemctl --user status hanare-comfyui --no-pager || true
 systemctl --user status hanare-llama --no-pager || true
+systemctl --user status hanare-strata --no-pager || true
 echo
 echo "On-demand commands:"
 echo "  systemctl --user start hanare-comfyui    # stop / status / restart"
 echo "  systemctl --user start hanare-llama      # stop / status / restart"
+echo "  systemctl --user start hanare-strata     # stop / status / restart"
