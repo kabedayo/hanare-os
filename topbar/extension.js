@@ -38,7 +38,10 @@ const HANARE_SERVICE_DISPLAY = {
     'llama-server': 'llama',
 };
 
-const HANARE_DEFAULT_MODEL = 'qwen3.8-27b';
+function hanareFallbackModel() {
+    const models = readHanareModels();
+    return models.length > 0 ? models[0].name : '';
+}
 
 function mibToGib(mib) {
     return (mib / 1024).toFixed(1);
@@ -127,11 +130,11 @@ function readHanareCurrentModel() {
         const file = Gio.File.new_for_path(hanareRepoFilePath('runtime', 'current-model'));
         const [ok, contents] = file.load_contents(null);
         if (!ok)
-            return HANARE_DEFAULT_MODEL;
+            return hanareFallbackModel();
         const text = new TextDecoder().decode(contents).trim();
-        return text !== '' ? text : HANARE_DEFAULT_MODEL;
+        return text !== '' ? text : hanareFallbackModel();
     } catch (e) {
-        return HANARE_DEFAULT_MODEL;
+        return hanareFallbackModel();
     }
 }
 
@@ -544,6 +547,25 @@ export default class VramRamMonitorExtension extends Extension {
             proc.connect('process-exited', () => {});
         } catch (e) {
             logError(e, `HANARE status: systemctl ${action} ${unit} failed`);
+        }
+        if (action === 'stop')
+            this._stopExternal(unit);
+    }
+
+    _stopExternal(unit) {
+        // A unit stop cannot see a same-service process that was started
+        // outside systemd; ask the helper to reap it (it refuses anything
+        // that does not match the service identity).
+        const svcName = Object.keys(HANARE_SERVICE_UNITS).find(k => HANARE_SERVICE_UNITS[k] === unit);
+        if (!svcName)
+            return;
+        try {
+            const proc = Gio.Subprocess.new(
+                [hanareRepoFilePath('scripts', 'hanare-service.sh'), 'stop-external', svcName],
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
+            proc.connect('process-exited', () => {});
+        } catch (e) {
+            logError(e, `HANARE status: stop-external ${svcName} failed`);
         }
     }
 

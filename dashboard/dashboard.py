@@ -30,8 +30,10 @@ EVENTS_PATH = os.environ.get(
 )
 MODELS_TSV = os.path.join(REPO_ROOT, "models", "models.tsv")
 CURRENT_MODEL_FILE = os.path.join(REPO_ROOT, "runtime", "current-model")
-DEFAULT_MODEL = "qwen3.8-27b"
 SYSTEMCTL = os.environ.get("HANARE_SYSTEMCTL", "systemctl")
+SERVICE_CLI = os.environ.get(
+    "HANARE_SERVICE_CLI", os.path.join(REPO_ROOT, "scripts", "hanare-service.sh")
+)
 SYSTEMD_RUN = os.environ.get("HANARE_SYSTEMD_RUN", "systemd-run")
 MODEL_CLI = os.environ.get(
     "HANARE_MODEL_CLI", os.path.join(REPO_ROOT, "scripts", "hanare-model.sh")
@@ -70,6 +72,54 @@ STATE_CLASSES = {
     "degraded": "st-degraded",
     "stuck-suspect": "st-stuck-suspect",
 }
+
+
+def unit_is_active(unit):
+    try:
+        st = subprocess.run(
+            [SYSTEMCTL, "--user", "is-active", unit],
+            capture_output=True,
+            text=True,
+            timeout=ACTION_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return st.stdout.strip() == "active"
+
+
+def service_is_external(svc):
+    """True when a snapshot service runs outside its systemd unit."""
+    if not isinstance(svc, dict):
+        return False
+    unit = SERVICE_UNITS.get(svc.get("name"))
+    if unit is None:
+        return False
+    if svc.get("state") not in ("running", "degraded", "stuck-suspect"):
+        return False
+    if not svc.get("pid"):
+        return False
+    return not unit_is_active(unit)
+
+
+def run_stop_external(service):
+    """Reap a same-service process that the unit stop cannot see."""
+    try:
+        proc = subprocess.run(
+            [SERVICE_CLI, "stop-external", service],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {"result": "error", "detail": "helper failed to run"}
+    out = (proc.stdout or "").strip()
+    if proc.returncode == 0:
+        return {"result": "stopped", "detail": out}
+    if proc.returncode == 3:
+        return {"result": "none", "detail": out}
+    if proc.returncode == 4:
+        return {"result": "refused", "detail": out}
+    return {"result": "still-running", "detail": out}
 
 
 def esc(value):
@@ -134,7 +184,8 @@ def current_model():
             return name
     except OSError:
         pass
-    return DEFAULT_MODEL
+    models = load_models()
+    return models[0] if models else ""
 
 
 def app_unit(app_id):
@@ -257,7 +308,7 @@ def render_page():
     parts.append("function doAction(service, action) {")
     parts.append("  postJSON('/action', {service: service, action: action})")
     parts.append("    .then(function (r) { return r.json().then(function (d) { return {status: r.status, d: d}; }); })")
-    parts.append("    .then(function (x) { if (x.status !== 200 || !x.d.ok) alert('action failed: ' + (x.d.unit || service)); })")
+    parts.append("    .then(function (x) { if (x.status !== 200 || !x.d.ok) alert('action failed: ' + (x.d.unit || service)); else if (x.d.external && x.d.external.result === 'stopped') alert('管理外のプロセスも停止しました: ' + x.d.external.detail); })")
     parts.append("    .catch(function (e) { alert('request failed: ' + e); })")
     parts.append("    .then(function () { setTimeout(function () { location.reload(); }, 1500); });")
     parts.append("}")
@@ -296,6 +347,8 @@ def render_page():
                 state = str(svc.get("state", "unknown"))
                 cls = STATE_CLASSES.get(state, "")
                 state_cell = '<span class="%s">%s</span>' % (cls, esc(state)) if cls else esc(state)
+                if service_is_external(svc):
+                    state_cell += ' <span class="st-degraded">管理外</span>'
                 parts.append(
                     "<tr><td>%s</td><td>%s</td><td>%s</td></tr>"
                     % (esc(name), esc(port), state_cell)
@@ -466,7 +519,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         unit = SERVICE_UNITS[service]
         ok, active = self._run_action(action, unit)
-        self._send_json(200, {"ok": ok, "unit": unit, "active": active})
+        payload = {"ok": ok, "unit": unit, "active": active}
+        if action == "stop" and ok:
+            payload["external"] = run_stop_external(service)
+        self._send_json(200, payload)
 
     def _handle_app(self):
         data = self._read_json_body()

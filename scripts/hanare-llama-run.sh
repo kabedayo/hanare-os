@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # HANARE llama core runner: effort-proxy (8080) -> llama-server (8081).
 # Model is selected from models/models.tsv:
-#   env HANARE_MODEL > runtime/current-model > qwen3.8-27b
+#   env HANARE_MODEL > runtime/current-model > first registry row
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

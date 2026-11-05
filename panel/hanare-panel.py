@@ -33,6 +33,9 @@ SYSTEMD_RUN = os.environ.get("HANARE_SYSTEMD_RUN", "systemd-run")
 MODEL_CLI = os.environ.get(
     "HANARE_MODEL_CLI", os.path.join(REPO_ROOT, "scripts", "hanare-model.sh")
 )
+SERVICE_CLI = os.environ.get(
+    "HANARE_SERVICE_CLI", os.path.join(REPO_ROOT, "scripts", "hanare-service.sh")
+)
 ACTION_TIMEOUT = 15
 
 SERVICES = {
@@ -188,7 +191,13 @@ def collect_model():
     services = []
     for svc in snap.get("services") or []:
         if isinstance(svc, dict) and svc.get("name") in SERVICES:
-            services.append(svc)
+            item = dict(svc)
+            item["external"] = bool(
+                item.get("state") in ("running", "degraded", "stuck-suspect")
+                and item.get("pid")
+                and not unit_is_active(SERVICES[item["name"]])
+            )
+            services.append(item)
     return {
         "timestamp": snap.get("timestamp"),
         "gpus": snap.get("gpus") or [],
@@ -257,7 +266,12 @@ def do_service_action(name, action):
     unit = SERVICES.get(name)
     if unit is None or action not in SERVICE_ACTIONS:
         return False
-    return run_cmd([SYSTEMCTL, "--user", action, unit])
+    ok = run_cmd([SYSTEMCTL, "--user", action, unit])
+    if ok and action == "stop":
+        # Also reap a same-service process started outside the unit:
+        # a unit stop alone cannot see it (it keeps the port and VRAM).
+        run_cmd([SERVICE_CLI, "stop-external", name])
+    return ok
 
 
 def do_app_action(app, action):
@@ -463,6 +477,8 @@ def build_window(app):
             name_label.get_style_context().add_class("name")
             texts.pack_start(name_label, False, False, 0)
             meta_bits = [state]
+            if svc.get("external"):
+                meta_bits.append("管理外")
             elapsed = format_elapsed(svc.get("elapsed_sec"))
             if state == "running" and elapsed:
                 meta_bits.append("稼働 %s" % elapsed)
