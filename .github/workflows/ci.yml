@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  checks:
+    name: checks (ubuntu-${{ matrix.ubuntu }})
+    runs-on: ubuntu-${{ matrix.ubuntu }}
+    strategy:
+      fail-fast: false
+      matrix:
+        ubuntu: ["22.04", "24.04"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-gi gir1.2-gtk-3.0
+
+      - name: Shell syntax
+        run: |
+          find . -name '*.sh' -not -path './.git/*' -print0 | xargs -0 -n1 bash -n
+
+      - name: Python syntax
+        run: python3 -m py_compile dashboard/*.py panel/*.py
+
+      - name: Run checks
+        run: |
+          fail=0
+          for t in tests/check-*.sh; do
+            echo "=== $t"
+            bash "$t" || fail=1
+          done
+          exit $fail

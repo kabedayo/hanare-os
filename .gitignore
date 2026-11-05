@@ -7,3 +7,4 @@ apps.d/*.app
 !apps.d/*.app.example
 systemd/hanare-comfyui.service
 docs/tasks/
+models/*.bak*
