@@ -1,0 +1,21 @@
+name: debug-002
+
+on:
+  workflow_dispatch:
+
+jobs:
+  debug:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Environment
+        run: |
+          echo "--- proxy env ---"
+          env | grep -i proxy || echo "(no proxy vars)"
+          echo "--- tools ---"
+          command -v nvidia-smi || echo "nvidia-smi: absent"
+          command -v ss curl python3 ps awk
+          echo "--- whoami ---"
+          id
+      - name: check-002 with trace
+        run: bash -x tests/check-002.sh || true
