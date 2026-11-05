@@ -2,6 +2,8 @@ name: debug-002
 
 on:
   workflow_dispatch:
+  push:
+    paths: [.github/workflows/debug-002.yml]
 
 jobs:
   debug:
