@@ -796,6 +796,9 @@ button.accent:hover {
     border: 2px solid #b54434;
     background-color: #fdf3ec;
 }
+.dnd-wrap {
+    background: transparent;
+}
 .drag-hint {
     color: #a39c8a;
     font-size: 13px;
@@ -979,7 +982,7 @@ def build_window(app):
     settings_status = Gtk.Label(label="", xalign=0)
     settings_status.get_style_context().add_class("meta")
 
-    drag_state = {"active": False}
+    drag_state = {"active": False, "pressed": False}
 
     def scroll_to_settings():
         def _do():
@@ -1115,9 +1118,9 @@ def build_window(app):
         settings_list.show_all()
 
     def refresh(*_args):
-        if drag_state["active"]:
-            # A drag is in flight: rebuilding now would destroy the
-            # drag source mid-gesture. Skip this cycle only.
+        if drag_state["active"] or drag_state.get("pressed"):
+            # A press/drag is in flight: rebuilding now would destroy
+            # the drag source mid-gesture. Skip this cycle only.
             return True
         data = collect_model()
         worst = worst_state(data["services"])
@@ -1146,24 +1149,32 @@ def build_window(app):
         clear(dynamic)
 
         svc_card = make_card("サービス")
-        svc_card.drag_dest_set(
+        svc_eb = Gtk.EventBox()
+        svc_eb.get_style_context().add_class("dnd-wrap")
+        svc_eb.set_visible_window(True)
+        _svc_parent = svc_card.get_parent()
+        _svc_parent.remove(svc_card)
+        svc_eb.add(svc_card)
+        _svc_parent.pack_start(svc_eb, False, False, 0)
+        _svc_parent.reorder_child(svc_eb, 0)
+        svc_eb.drag_dest_set(
             Gtk.DestDefaults.ALL,
             [Gtk.TargetEntry.new("text/plain", Gtk.TargetFlags.SAME_APP, 0)],
             Gdk.DragAction.COPY,
         )
 
         def on_svc_drag_motion(widget, context, _x, _y, time):
-            widget.get_style_context().add_class("drop-active")
+            svc_card.get_style_context().add_class("drop-active")
             Gdk.drag_status(context, Gdk.DragAction.COPY, time)
             return True
 
         def on_svc_drag_leave(widget, _context, _time):
-            widget.get_style_context().remove_class("drop-active")
+            svc_card.get_style_context().remove_class("drop-active")
 
         def on_svc_drag_data_received(
             widget, context, _x, _y, selection, _info, time
         ):
-            widget.get_style_context().remove_class("drop-active")
+            svc_card.get_style_context().remove_class("drop-active")
             app_id = (selection.get_text() or "").strip()
             found = None
             for candidate in data["apps"]:
@@ -1174,11 +1185,11 @@ def build_window(app):
                 apply_app_prefill(found)
             Gtk.drag_finish(context, found is not None, False, time)
 
-        svc_card.connect("drag-motion", on_svc_drag_motion)
-        svc_card.connect("drag-leave", on_svc_drag_leave)
-        svc_card.connect("drag-data-received", on_svc_drag_data_received)
+        svc_eb.connect("drag-motion", on_svc_drag_motion)
+        svc_eb.connect("drag-leave", on_svc_drag_leave)
+        svc_eb.connect("drag-data-received", on_svc_drag_data_received)
         svc_hint = Gtk.Label(
-            label="ヒント: 下の「アプリ」の行をここへドラッグすると、サービス登録フォームに取り込めます",
+            label="ヒント: 下の「アプリ」の行をここへドラッグ（またはアプリの行をクリック）すると、サービス登録フォームに取り込めます",
             xalign=0,
         )
         svc_hint.get_style_context().add_class("meta")
@@ -1297,14 +1308,44 @@ def build_window(app):
             meta.get_style_context().add_class("meta")
             texts.pack_start(meta, False, False, 0)
             row.pack_start(texts, True, True, 0)
-            row.set_tooltip_text(
-                "「サービス」カードへドラッグすると、サービス登録フォームに取り込めます"
+            # Gtk.Box has no GdkWindow, so it cannot receive the X11
+            # press events a drag starts from. Wrap the row in an
+            # EventBox (own window) and make THAT the drag source.
+            eb = Gtk.EventBox()
+            eb.get_style_context().add_class("dnd-wrap")
+            eb.set_visible_window(True)
+            eb.set_tooltip_text(
+                "「サービス」カードへドラッグ（またはクリック）すると、サービス登録フォームに取り込めます"
             )
-            row.drag_source_set(
+            eb.drag_source_set(
                 Gdk.ModifierType.BUTTON1_MASK,
                 [Gtk.TargetEntry.new("text/plain", Gtk.TargetFlags.SAME_APP, 0)],
                 Gdk.DragAction.COPY,
             )
+
+            def _over_button(ev, _row=row):
+                for child in _row.get_children():
+                    if isinstance(child, Gtk.Button):
+                        alloc = child.get_allocation()
+                        if (
+                            alloc.x <= ev.x <= alloc.x + alloc.width
+                            and alloc.y <= ev.y <= alloc.y + alloc.height
+                        ):
+                            return True
+                return False
+
+            def on_app_press(_widget, event):
+                if not _over_button(event):
+                    drag_state["pressed"] = True
+                return False
+
+            def on_app_release(_widget, event, _item=app_item):
+                was_pressed = drag_state.get("pressed")
+                drag_state["pressed"] = False
+                # Plain click (no drag happened): same import as a drop.
+                if was_pressed and not drag_state["active"] and not _over_button(event):
+                    apply_app_prefill(_item)
+                return False
 
             def on_app_drag_begin(_widget, _context, _aid=app_item["id"]):
                 drag_state["active"] = True
@@ -1317,10 +1358,14 @@ def build_window(app):
 
             def on_app_drag_end(_widget, _context):
                 drag_state["active"] = False
+                drag_state["pressed"] = False
 
-            row.connect("drag-begin", on_app_drag_begin)
-            row.connect("drag-data-get", on_app_drag_data_get)
-            row.connect("drag-end", on_app_drag_end)
+            eb.connect("button-press-event", on_app_press)
+            eb.connect("button-release-event", on_app_release)
+            eb.connect("drag-begin", on_app_drag_begin)
+            eb.connect("drag-data-get", on_app_drag_data_get)
+            eb.connect("drag-end", on_app_drag_end)
+            eb.add(row)
             if app_item["active"]:
                 row.pack_end(
                     action_button(
@@ -1340,7 +1385,7 @@ def build_window(app):
                     ),
                     False, False, 0,
                 )
-            app_card.pack_start(row, False, False, 0)
+            app_card.pack_start(eb, False, False, 0)
         if not data["apps"]:
             empty = Gtk.Label(label="アプリなし（~/hanare-apps/ に置くと出ます）", xalign=0)
             empty.get_style_context().add_class("meta")
