@@ -19,6 +19,11 @@ else
 fi
 cp "$REPO_ROOT/systemd/hanare-llama.service" "$UNIT_DIR/hanare-llama.service"
 cp "$REPO_ROOT/systemd/hanare-strata.service" "$UNIT_DIR/hanare-strata.service"
+# Registry-managed services (services/services.tsv rows whose exec is
+# not "-") get their units generated from the registry instead.
+if [ -f "$REPO_ROOT/scripts/hanare-service-gen.sh" ]; then
+  bash "$REPO_ROOT/scripts/hanare-service-gen.sh"
+fi
 systemctl --user daemon-reload
 
 echo "Installed user units:"

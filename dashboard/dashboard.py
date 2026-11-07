@@ -60,11 +60,60 @@ ACTION_TIMEOUT = 15
 PORT = int(os.environ.get("HANARE_DASH_PORT", "8790"))
 MAX_EVENTS = 30
 
-SERVICE_UNITS = {
+SERVICES_TSV = os.environ.get(
+    "HANARE_SERVICES_TSV", os.path.join(REPO_ROOT, "services", "services.tsv")
+)
+# Fallback for snapshots/registries from before the registry carried
+# unit names; the registry (services/services.tsv) is the source of
+# truth and wins over this table.
+FALLBACK_SERVICE_UNITS = {
     "comfyui": "hanare-comfyui",
     "llama-server": "hanare-llama",
 }
 SERVICE_ACTIONS = ("start", "stop", "restart")
+# hanare-service.sh stop-external has its own fixed allowlist; only
+# these services may be reaped through it.
+STOP_EXTERNAL_SERVICES = ("llama-server", "comfyui", "strata")
+
+
+def load_service_units():
+    """Build the {service name: unit} allowlist.
+
+    Order: registry rows first (in registry order), then any unit a
+    snapshot carries for a name the registry does not know, then the
+    built-in fallback for the two original services. Anything not in
+    the returned map is not operable from the dashboard.
+    """
+    units = {}
+    try:
+        with open(SERVICES_TSV, "r", encoding="utf-8") as f:
+            rows = f.readlines()
+    except OSError:
+        rows = []
+    for row in rows:
+        row = row.rstrip("\n")
+        if not row or row.startswith("#"):
+            continue
+        parts = row.split("\t")
+        if len(parts) < 5:
+            continue
+        name = parts[0].strip()
+        unit = parts[4].strip()
+        if name and unit and unit != "-":
+            units[name] = unit[:-8] if unit.endswith(".service") else unit
+    snap = load_snapshot()
+    if snap:
+        for svc in snap.get("services") or []:
+            if isinstance(svc, dict):
+                name = svc.get("name")
+                unit = svc.get("unit")
+                if name and unit and name not in units:
+                    units[name] = (
+                        unit[:-8] if unit.endswith(".service") else unit
+                    )
+    for name, unit in FALLBACK_SERVICE_UNITS.items():
+        units.setdefault(name, unit)
+    return units
 
 STATE_CLASSES = {
     "running": "st-running",
@@ -91,7 +140,7 @@ def service_is_external(svc):
     """True when a snapshot service runs outside its systemd unit."""
     if not isinstance(svc, dict):
         return False
-    unit = SERVICE_UNITS.get(svc.get("name"))
+    unit = svc.get("unit") or load_service_units().get(svc.get("name"))
     if unit is None:
         return False
     if svc.get("state") not in ("running", "degraded", "stuck-suspect"):
@@ -242,7 +291,7 @@ def render_page():
     parts.append("<h1>HANARE Dashboard</h1>")
 
     parts.append("<h2>Controls</h2>")
-    for svc, unit in SERVICE_UNITS.items():
+    for svc, unit in load_service_units().items():
         btns = "".join(
             '<button onclick="doAction(%s, %s)">%s</button>'
             % (js_str(svc), js_str(action), label)
@@ -505,7 +554,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         service = data.get("service")
         action = data.get("action")
-        if not isinstance(service, str) or service not in SERVICE_UNITS:
+        units = load_service_units()
+        if not isinstance(service, str) or service not in units:
             self._send_json(
                 400,
                 {"ok": False, "error": "unknown service: %s" % esc(service)},
@@ -517,10 +567,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 {"ok": False, "error": "unknown action: %s" % esc(action)},
             )
             return
-        unit = SERVICE_UNITS[service]
+        unit = units[service]
         ok, active = self._run_action(action, unit)
         payload = {"ok": ok, "unit": unit, "active": active}
-        if action == "stop" and ok:
+        if action == "stop" and ok and service in STOP_EXTERNAL_SERVICES:
             payload["external"] = run_stop_external(service)
         self._send_json(200, payload)
 

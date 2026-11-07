@@ -4,9 +4,12 @@
 Design: B (wa-modern) x C (cards). Reads the same runtime files as the
 topbar extension and the web dashboard (runtime/last-status.json,
 runtime/events.jsonl, models/models.tsv, runtime/current-model) and acts
-through the same fixed routes: systemctl --user for the two managed
-services, systemd-run --user for apps, scripts/hanare-model.sh for model
-selection. No shell is ever invoked.
+through the same fixed routes: systemctl --user for the services in the
+registry (services/services.tsv, which is the single source of truth
+for service name -> unit/display/exec), systemd-run --user for apps,
+scripts/hanare-model.sh for model selection. No shell is ever invoked.
+The settings card at the bottom edits that registry (services and new
+models) and regenerates units via scripts/hanare-service-gen.sh.
 
 Usage:
   hanare-panel.py           open the window
@@ -15,6 +18,7 @@ Usage:
 
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -38,11 +42,22 @@ SERVICE_CLI = os.environ.get(
 )
 ACTION_TIMEOUT = 15
 
-SERVICES = {
+SERVICES_TSV = os.path.join(REPO_ROOT, "services", "services.tsv")
+SERVICE_GEN = os.environ.get(
+    "HANARE_SERVICE_GEN", os.path.join(REPO_ROOT, "scripts", "hanare-service-gen.sh")
+)
+UNIT_DIR = os.path.expanduser(
+    os.environ.get("HANARE_UNIT_DIR", "~/.config/systemd/user")
+)
+# Fallback for snapshots/registries from before the registry carried
+# unit names; services/services.tsv is the source of truth and wins.
+FALLBACK_SERVICES = {
     "comfyui": "hanare-comfyui.service",
     "llama-server": "hanare-llama.service",
 }
 SERVICE_ACTIONS = ("start", "stop", "restart")
+# hanare-service.sh stop-external has its own fixed allowlist.
+STOP_EXTERNAL_SERVICES = ("llama-server", "comfyui", "strata")
 
 STATE_COLORS = {
     "running": "#58a34c",
@@ -143,6 +158,213 @@ def app_unit(app_id):
     return "hanare-app-%s" % app_id
 
 
+REGISTRY_COLUMNS = (
+    "name", "port", "gpu_keyword", "display", "unit", "exec", "workdir", "url",
+)
+REGISTRY_HEADER = (
+    "# HANARE service registry - one row per service, tab-separated.\n"
+    "# Columns: name<TAB>port<TAB>gpu_keyword<TAB>display<TAB>unit<TAB>exec<TAB>workdir<TAB>url\n"
+    "# exec \"-\" means a hand-managed unit: no unit file is auto-generated for it.\n"
+    "# Trailing columns may be omitted (empty). See services/README.md.\n"
+)
+SERVICE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+UNIT_NAME_RE = re.compile(r"^[A-Za-z0-9_@.\-]+$")
+
+
+def load_service_registry():
+    """Parse services/services.tsv into a list of row dicts."""
+    rows = []
+    try:
+        with open(SERVICES_TSV, encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return rows
+    for line in lines:
+        line = line.rstrip("\n")
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        try:
+            port = int(parts[1])
+        except ValueError:
+            continue
+        row = {col: "" for col in REGISTRY_COLUMNS}
+        for i, col in enumerate(REGISTRY_COLUMNS):
+            if i < len(parts):
+                row[col] = parts[i].strip()
+        row["port"] = port
+        rows.append(row)
+    return rows
+
+
+def service_units():
+    """{service name: unit-with-.service} from the registry + fallback."""
+    units = {}
+    for row in load_service_registry():
+        unit = row.get("unit") or ""
+        if unit and unit != "-":
+            if not unit.endswith(".service"):
+                unit += ".service"
+            units[row["name"]] = unit
+    for name, unit in FALLBACK_SERVICES.items():
+        units.setdefault(name, unit)
+    return units
+
+
+def snapshot_unit(svc, units):
+    unit = svc.get("unit") or ""
+    if unit:
+        return unit if unit.endswith(".service") else unit + ".service"
+    return units.get(svc.get("name"))
+
+
+def save_service_registry(rows):
+    lines = [REGISTRY_HEADER]
+    for row in rows:
+        values = []
+        for col in REGISTRY_COLUMNS:
+            value = row.get(col, "")
+            values.append(str(value))
+        lines.append("\t".join(values) + "\n")
+    tmp = SERVICES_TSV + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.writelines(lines)
+    os.replace(tmp, SERVICES_TSV)
+
+
+def regenerate_units():
+    """Generate units for exec-managed rows + daemon-reload (via the gen script)."""
+    try:
+        proc = subprocess.run(
+            ["bash", SERVICE_GEN],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        return proc.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def upsert_service(form):
+    """Validate a settings-form dict and insert/update its registry row.
+
+    Returns (ok, message). On success the registry is saved and units
+    are regenerated (which also daemon-reloads).
+    """
+    name = (form.get("name") or "").strip()
+    display = (form.get("display") or "").strip() or name
+    exec_cmd = (form.get("exec") or "").strip() or "-"
+    workdir = (form.get("workdir") or "").strip() or "-"
+    url = (form.get("url") or "").strip() or "-"
+    gpu_keyword = (form.get("gpu_keyword") or "").strip() or "-"
+    if not SERVICE_ID_RE.match(name):
+        return False, "IDは半角小文字・数字・ハイフン（先頭は英数字）で入力してください"
+    try:
+        port = int(form.get("port") or "")
+    except (TypeError, ValueError):
+        return False, "ポートは数値で入力してください"
+    if not (1 <= port <= 65535):
+        return False, "ポートは 1〜65535 で入力してください"
+    for value in (display, exec_cmd, workdir, url):
+        if "\t" in value or "\n" in value:
+            return False, "タブや改行は使えません"
+    if exec_cmd != "-":
+        unit = "hanare-%s" % name
+    else:
+        unit = (form.get("unit") or "").strip() or ("hanare-%s" % name)
+    if not UNIT_NAME_RE.match(unit):
+        return False, "ユニット名に使えない文字があります"
+    rows = load_service_registry()
+    new_row = {
+        "name": name,
+        "port": port,
+        "gpu_keyword": gpu_keyword,
+        "display": display,
+        "unit": unit,
+        "exec": exec_cmd,
+        "workdir": workdir,
+        "url": url,
+    }
+    for i, row in enumerate(rows):
+        if row["name"] == name:
+            rows[i] = new_row
+            break
+    else:
+        rows.append(new_row)
+    try:
+        save_service_registry(rows)
+    except OSError as exc:
+        return False, "レジストリの保存に失敗しました: %s" % exc
+    if not regenerate_units():
+        return False, "保存はできましたがユニット生成に失敗しました"
+    return True, "サービス「%s」を保存しました" % name
+
+
+def remove_service(name):
+    """Remove a registry row; also remove its unit file if we generated it."""
+    rows = load_service_registry()
+    target = None
+    kept = []
+    for row in rows:
+        if row["name"] == name:
+            target = row
+        else:
+            kept.append(row)
+    if target is None:
+        return False, "サービスが見つかりません: %s" % name
+    try:
+        save_service_registry(kept)
+    except OSError as exc:
+        return False, "レジストリの保存に失敗しました: %s" % exc
+    unit = target.get("unit") or ""
+    if target.get("exec") not in ("", "-") and unit:
+        path = os.path.join(UNIT_DIR, unit + ".service")
+        try:
+            with open(path, encoding="utf-8") as fh:
+                generated = "hanare-service-gen" in fh.read(300)
+        except OSError:
+            generated = False
+        if generated:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    regenerate_units()
+    return True, "サービス「%s」を削除しました" % name
+
+
+def add_model(form):
+    """Append one row to models/models.tsv. Returns (ok, message)."""
+    name = (form.get("name") or "").strip()
+    gguf = (form.get("gguf") or "").strip()
+    mmproj = (form.get("mmproj") or "").strip() or "-"
+    profile = (form.get("profile") or "").strip() or "generic"
+    note = (form.get("note") or "").strip()
+    if not name or "\t" in name or "\n" in name or " " in name:
+        return False, "モデル名は空白なしで入力してください"
+    if not gguf or not os.path.isfile(gguf):
+        return False, "GGUFファイルが見つかりません: %s" % gguf
+    try:
+        ctx = int(form.get("ctx") or "")
+    except (TypeError, ValueError):
+        return False, "ctxは数値で入力してください"
+    if ctx <= 0:
+        return False, "ctxは正の数で入力してください"
+    for model in load_models():
+        if model["name"] == name:
+            return False, "同名のモデルが既にあります: %s" % name
+    row = "\t".join([name, gguf, mmproj, str(ctx), profile, note, "-"]) + "\n"
+    try:
+        with open(MODELS_TSV, "a", encoding="utf-8") as fh:
+            fh.write(row)
+    except OSError as exc:
+        return False, "モデル登録の保存に失敗しました: %s" % exc
+    return True, "モデル「%s」を追加しました" % name
+
+
 def run_cmd(argv):
     try:
         proc = subprocess.run(
@@ -188,21 +410,28 @@ def scan_apps():
 
 def collect_model():
     snap = load_snapshot()
+    units = service_units()
     services = []
     for svc in snap.get("services") or []:
-        if isinstance(svc, dict) and svc.get("name") in SERVICES:
-            item = dict(svc)
-            item["external"] = bool(
-                item.get("state") in ("running", "degraded", "stuck-suspect")
-                and item.get("pid")
-                and not unit_is_active(SERVICES[item["name"]])
-            )
-            services.append(item)
+        if not isinstance(svc, dict):
+            continue
+        unit = snapshot_unit(svc, units)
+        if unit is None:
+            continue
+        item = dict(svc)
+        item["unit"] = unit
+        item["external"] = bool(
+            item.get("state") in ("running", "degraded", "stuck-suspect")
+            and item.get("pid")
+            and not unit_is_active(unit)
+        )
+        services.append(item)
     return {
         "timestamp": snap.get("timestamp"),
         "gpus": snap.get("gpus") or [],
         "memory": snap.get("memory") or {},
         "services": services,
+        "registry": load_service_registry(),
         "models": load_models(),
         "current_model": current_model(),
         "apps": scan_apps(),
@@ -263,11 +492,11 @@ def event_summary(event):
 
 
 def do_service_action(name, action):
-    unit = SERVICES.get(name)
+    unit = service_units().get(name)
     if unit is None or action not in SERVICE_ACTIONS:
         return False
     ok = run_cmd([SYSTEMCTL, "--user", action, unit])
-    if ok and action == "stop":
+    if ok and action == "stop" and name in STOP_EXTERNAL_SERVICES:
         # Also reap a same-service process started outside the unit:
         # a unit stop alone cannot see it (it keeps the port and VRAM).
         run_cmd([SERVICE_CLI, "stop-external", name])
@@ -293,7 +522,10 @@ def do_app_action(app, action):
 def do_model_select(name):
     if not run_cmd([MODEL_CLI, "use", name]):
         return False
-    return run_cmd([SYSTEMCTL, "--user", "restart", SERVICES["llama-server"]])
+    unit = service_units().get("llama-server")
+    if unit is None:
+        return False
+    return run_cmd([SYSTEMCTL, "--user", "restart", unit])
 
 
 CSS = """
@@ -410,6 +642,8 @@ def build_window(app):
     root.pack_start(scroller, True, True, 0)
     content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
     scroller.add(content)
+    dynamic = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+    content.pack_start(dynamic, False, False, 0)
 
     def clear(box):
         for child in box.get_children():
@@ -421,7 +655,7 @@ def build_window(app):
         label = Gtk.Label(label=heading, xalign=0)
         label.get_style_context().add_class("card-title")
         frame.pack_start(label, False, False, 0)
-        content.pack_start(frame, False, False, 0)
+        dynamic.pack_start(frame, False, False, 0)
         return frame
 
     def dot_label(state):
@@ -437,6 +671,141 @@ def build_window(app):
             button.get_style_context().add_class("accent")
         button.connect("clicked", callback)
         return button
+
+
+    # ---- settings card (static shell; only its service list refreshes) --
+    settings_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+    settings_card.get_style_context().add_class("card")
+    settings_title = Gtk.Label(label="サービス設定（レジストリ）", xalign=0)
+    settings_title.get_style_context().add_class("card-title")
+    settings_card.pack_start(settings_title, False, False, 0)
+    settings_hint = Gtk.Label(
+        label="services/services.tsv が唯一の定義場所です。保存するとユニット生成と daemon-reload まで行います（起動コマンドが空欄のサービスは手管理ユニット扱い）。",
+        xalign=0,
+    )
+    settings_hint.get_style_context().add_class("meta")
+    settings_card.pack_start(settings_hint, False, False, 0)
+    content.pack_start(settings_card, False, False, 0)
+
+    settings_list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+    settings_card.pack_start(settings_list, False, False, 0)
+
+    def labeled_entry(label_text, parent):
+        row_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        row_box.get_style_context().add_class("row")
+        lab = Gtk.Label(label=label_text, xalign=0)
+        lab.set_size_request(110, -1)
+        lab.get_style_context().add_class("meta")
+        entry = Gtk.Entry()
+        row_box.pack_start(lab, False, False, 0)
+        row_box.pack_start(entry, True, True, 0)
+        parent.pack_start(row_box, False, False, 0)
+        return entry
+
+    svc_entries = {
+        "name": labeled_entry("ID", settings_card),
+        "display": labeled_entry("表示名", settings_card),
+        "port": labeled_entry("ポート", settings_card),
+        "exec": labeled_entry("起動コマンド", settings_card),
+        "workdir": labeled_entry("作業フォルダ", settings_card),
+        "url": labeled_entry("URL", settings_card),
+    }
+    svc_entries["exec"].set_placeholder_text(
+        "例: python3 -m http.server 8899 --bind 127.0.0.1（空欄 = 手管理ユニット）"
+    )
+    settings_status = Gtk.Label(label="", xalign=0)
+    settings_status.get_style_context().add_class("meta")
+
+    def fill_service_form(row):
+        svc_entries["name"].set_text(row.get("name") or "")
+        svc_entries["display"].set_text(row.get("display") or "")
+        svc_entries["port"].set_text(str(row.get("port") or ""))
+        exec_val = row.get("exec") or ""
+        svc_entries["exec"].set_text("" if exec_val == "-" else exec_val)
+        wd_val = row.get("workdir") or ""
+        svc_entries["workdir"].set_text("" if wd_val == "-" else wd_val)
+        url_val = row.get("url") or ""
+        svc_entries["url"].set_text("" if url_val == "-" else url_val)
+
+    def on_save_service(_button):
+        form = {key: entry.get_text() for key, entry in svc_entries.items()}
+        if not form["exec"].strip():
+            form["exec"] = "-"
+            form["unit"] = "hanare-%s" % form["name"].strip()
+        _ok, message = upsert_service(form)
+        settings_status.set_text(message)
+        refresh()
+
+    def on_remove_service(_button, svc_name):
+        _ok, message = remove_service(svc_name)
+        settings_status.set_text(message)
+        refresh()
+
+    save_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    save_btn = Gtk.Button(label="サービスを保存")
+    save_btn.get_style_context().add_class("accent")
+    save_btn.connect("clicked", on_save_service)
+    save_row.pack_start(save_btn, False, False, 0)
+    save_row.pack_start(settings_status, True, True, 0)
+    settings_card.pack_start(save_row, False, False, 0)
+
+    model_title = Gtk.Label(label="モデル追加", xalign=0)
+    model_title.get_style_context().add_class("card-title")
+    settings_card.pack_start(model_title, False, False, 0)
+    model_entries = {
+        "name": labeled_entry("モデル名", settings_card),
+        "gguf": labeled_entry("GGUFパス", settings_card),
+        "ctx": labeled_entry("ctx", settings_card),
+        "mmproj": labeled_entry("mmproj（任意）", settings_card),
+    }
+
+    def on_add_model(_button):
+        form = {key: entry.get_text() for key, entry in model_entries.items()}
+        ok, message = add_model(form)
+        settings_status.set_text(message)
+        if ok:
+            for entry in model_entries.values():
+                entry.set_text("")
+        refresh()
+
+    model_btn = Gtk.Button(label="モデルを追加")
+    model_btn.connect("clicked", on_add_model)
+    model_btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    model_btn_row.pack_start(model_btn, False, False, 0)
+    settings_card.pack_start(model_btn_row, False, False, 0)
+
+    def rebuild_settings_list(rows):
+        clear(settings_list)
+        for row in rows:
+            line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            line.get_style_context().add_class("row")
+            text = "%s · %s · :%s · %s" % (
+                row.get("name"),
+                row.get("display") or row.get("name"),
+                row.get("port"),
+                row.get("unit"),
+            )
+            if (row.get("exec") or "-") == "-":
+                text += " · 手管理ユニット"
+            lab = Gtk.Label(label=text, xalign=0)
+            lab.get_style_context().add_class("meta")
+            line.pack_start(lab, True, True, 0)
+            line.pack_end(
+                action_button(
+                    "削除", True,
+                    lambda _b, n=row.get("name"): on_remove_service(_b, n),
+                ),
+                False, False, 0,
+            )
+            line.pack_end(
+                action_button(
+                    "編集", True,
+                    lambda _b, r=dict(row): fill_service_form(r),
+                ),
+                False, False, 0,
+            )
+            settings_list.pack_start(line, False, False, 0)
+        settings_list.show_all()
 
     def refresh(*_args):
         data = collect_model()
@@ -463,7 +832,7 @@ def build_window(app):
         stamp = (data["timestamp"] or "")[11:16]
         header_meta.set_text(" · ".join(gpu_bits + ([stamp] if stamp else [])))
 
-        clear(content)
+        clear(dynamic)
 
         svc_card = make_card("サービス")
         for svc in data["services"]:
@@ -622,6 +991,7 @@ def build_window(app):
             empty.get_style_context().add_class("meta")
             ev_card.pack_start(empty, False, False, 0)
 
+        rebuild_settings_list(data["registry"])
         content.show_all()
         return True
 

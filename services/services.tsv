@@ -1,3 +1,7 @@
-llama-server	8080	Tesla V100
-comfyui	8188	Tesla V100
-strata	8095	Tesla V100
+# HANARE service registry - one row per service, tab-separated.
+# Columns: name<TAB>port<TAB>gpu_keyword<TAB>display<TAB>unit<TAB>exec<TAB>workdir<TAB>url
+# exec "-" means a hand-managed unit: no unit file is auto-generated for it.
+# Trailing columns may be omitted (empty). See services/README.md.
+llama-server	8080	Tesla V100	llama	hanare-llama	-	-	-
+comfyui	8188	Tesla V100	ComfyUI	hanare-comfyui	-	-	http://127.0.0.1:8188/
+strata	8095	Tesla V100	Strata	hanare-strata	/usr/bin/bash %h/hanare-os/scripts/hanare-strata-run.sh	-	http://127.0.0.1:8095/

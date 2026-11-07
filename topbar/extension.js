@@ -28,17 +28,31 @@ const HANARE_COLOR_DEGRADED = '#d29922';
 const HANARE_COLOR_RUNNING = '#58a34c';
 const HANARE_COLOR_INACTIVE = '#8a8a8a';
 
-const HANARE_SERVICE_UNITS = {
+// Service unit/display names come from the status snapshot, which
+// status.sh builds from the single registry (services/services.tsv).
+// The tables below are only a fallback for snapshots written by an
+// older status.sh that did not carry unit/display fields yet.
+const HANARE_FALLBACK_UNITS = {
     comfyui: 'hanare-comfyui',
     'llama-server': 'hanare-llama',
-    strata: 'hanare-strata',
 };
 
-const HANARE_SERVICE_DISPLAY = {
+const HANARE_FALLBACK_DISPLAY = {
     comfyui: 'ComfyUI',
     'llama-server': 'llama',
-    strata: 'Strata',
 };
+
+function hanareSvcUnit(svc) {
+    if (svc && typeof svc.unit === 'string' && svc.unit !== '')
+        return svc.unit;
+    return svc ? HANARE_FALLBACK_UNITS[svc.name] : undefined;
+}
+
+function hanareSvcDisplay(svc) {
+    if (svc && typeof svc.display === 'string' && svc.display !== '')
+        return svc.display;
+    return (svc && HANARE_FALLBACK_DISPLAY[svc.name]) || (svc ? svc.name : '');
+}
 
 function hanareFallbackModel() {
     const models = readHanareModels();
@@ -468,10 +482,10 @@ export default class VramRamMonitorExtension extends Extension {
             menu.addMenuItem(item);
             this._hanareMenuItems.push(item);
 
-            const unit = HANARE_SERVICE_UNITS[svc.name];
+            const unit = hanareSvcUnit(svc);
             if (!unit)
                 continue;
-            const display = HANARE_SERVICE_DISPLAY[svc.name] || svc.name;
+            const display = hanareSvcDisplay(svc);
             const state = (svc.state && typeof svc.state === 'string') ? svc.state : '';
             const active = state === 'running' || state === 'degraded' || state === 'stuck-suspect';
             const actions = active
@@ -480,7 +494,7 @@ export default class VramRamMonitorExtension extends Extension {
             for (const [action, label] of actions) {
                 const controlItem = new PopupMenu.PopupMenuItem(label);
                 controlItem.connect('activate', () => {
-                    this._runSystemctlUser(action, unit);
+                    this._runSystemctlUser(action, unit, svc.name);
                     this._refreshHanare();
                 });
                 menu.addMenuItem(controlItem);
@@ -545,7 +559,7 @@ export default class VramRamMonitorExtension extends Extension {
         this._hanareMenuItems.push(dashItem);
     }
 
-    _runSystemctlUser(action, unit) {
+    _runSystemctlUser(action, unit, svcName) {
         try {
             const proc = Gio.Subprocess.new(
                 ['systemctl', '--user', action, unit],
@@ -555,14 +569,14 @@ export default class VramRamMonitorExtension extends Extension {
             logError(e, `HANARE status: systemctl ${action} ${unit} failed`);
         }
         if (action === 'stop')
-            this._stopExternal(unit);
+            this._stopExternal(svcName);
     }
 
-    _stopExternal(unit) {
+    _stopExternal(svcName) {
         // A unit stop cannot see a same-service process that was started
         // outside systemd; ask the helper to reap it (it refuses anything
-        // that does not match the service identity).
-        const svcName = Object.keys(HANARE_SERVICE_UNITS).find(k => HANARE_SERVICE_UNITS[k] === unit);
+        // that does not match the service identity, and only supports the
+        // services in its own fixed allowlist).
         if (!svcName)
             return;
         try {

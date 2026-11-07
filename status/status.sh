@@ -87,11 +87,15 @@ swap_used=$(( swap_total - swap_free ))
 svc_json=""
 svc_table=""
 if [ -r "$TSV" ]; then
-  while IFS=$'\t' read -r name port kw; do
+  while IFS=$'\t' read -r name port kw display unit exec workdir url; do
     name="$(trim "$name")"
     case "$name" in ''|'#'*) continue ;; esac
     [[ "$port" =~ ^[0-9]+$ ]] || continue
     kw="$(trim "$kw")"
+    display="$(trim "${display:-}")"
+    unit="$(trim "${unit:-}")"
+    url="$(trim "${url:-}")"
+    [ "$url" = "-" ] && url=""
 
     # listening pid from ss -tlnp (may be invisible => null)
     pid=""
@@ -153,7 +157,7 @@ if [ -r "$TSV" ]; then
 
     start_json="null"
     [ -n "$start" ] && start_json="\"$(json_escape "$start")\""
-    svc_json+="${svc_json:+,}{\"name\":\"$(json_escape "$name")\",\"port\":${port},\"gpu_keyword\":\"$(json_escape "$kw")\",\"state\":\"${state}\",\"pid\":${pid:-null},\"rss_kib\":${rss},\"cpu_percent\":${cpu},\"elapsed_sec\":${elapsed},\"start_time\":${start_json},\"port_responds\":${responds}}"
+    svc_json+="${svc_json:+,}{\"name\":\"$(json_escape "$name")\",\"port\":${port},\"gpu_keyword\":\"$(json_escape "$kw")\",\"display\":\"$(json_escape "$display")\",\"unit\":\"$(json_escape "$unit")\",\"url\":\"$(json_escape "$url")\",\"state\":\"${state}\",\"pid\":${pid:-null},\"rss_kib\":${rss},\"cpu_percent\":${cpu},\"elapsed_sec\":${elapsed},\"start_time\":${start_json},\"port_responds\":${responds}}"
     svc_table+=$(printf '  %-16s %s  %-14s pid=%s rss=%s cpu=%s elapsed=%s\n' "$name" "$port" "$state" "${pid:-null}" "$rss" "$cpu" "$elapsed")
   done < "$TSV"
 fi
