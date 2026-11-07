@@ -11,6 +11,7 @@ no shell.
 import html
 import json
 import os
+import re
 import subprocess
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -58,6 +59,13 @@ DESKTOP_DIRS = (
 )
 ACTION_TIMEOUT = 15
 PORT = int(os.environ.get("HANARE_DASH_PORT", "8790"))
+CAPTURE_PATH = os.environ.get(
+    "HANARE_CAPTURE_CLI", os.path.join(REPO_ROOT, "feed", "capture.sh")
+)
+# Cookie set on the first page load; its presence is how later loads
+# (including the 30 s meta refresh) know the open-time capture has
+# already been done for this browser.
+SEEN_COOKIE = "hanare_seen"
 MAX_EVENTS = 30
 
 SERVICES_TSV = os.environ.get(
@@ -169,6 +177,123 @@ def run_stop_external(service):
     if proc.returncode == 4:
         return {"result": "refused", "detail": out}
     return {"result": "still-running", "detail": out}
+
+
+def run_stop_app_external(app_id):
+    """Reap an app process that its transient unit cannot see."""
+    try:
+        proc = subprocess.run(
+            [SERVICE_CLI, "stop-app-external", app_id],
+            capture_output=True,
+            text=True,
+            timeout=40,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {"result": "error", "detail": "helper failed to run"}
+    out = (proc.stdout or "").strip()
+    if proc.returncode == 0:
+        return {"result": "stopped", "detail": out}
+    if proc.returncode == 3:
+        return {"result": "none", "detail": out}
+    if proc.returncode == 4:
+        return {"result": "refused", "detail": out}
+    return {"result": "still-running", "detail": out}
+
+
+def run_capture():
+    """Run one status capture pass now.
+
+    feed/capture.sh flock-serializes passes, so calling this next to
+    the 60 s timer is safe; a failure just keeps the old snapshot.
+    """
+    env = dict(os.environ)
+    env["HANARE_STATUS_SNAP"] = SNAP_PATH
+    try:
+        subprocess.run(
+            ["/usr/bin/bash", CAPTURE_PATH],
+            capture_output=True,
+            timeout=60,
+            env=env,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def app_port(app):
+    try:
+        return urlparse(app.get("url") or "").port
+    except ValueError:
+        return None
+
+
+def app_listener_pids(port):
+    """PIDs listening on a TCP port (via ss), best effort."""
+    try:
+        proc = subprocess.run(
+            ["ss", "-tlnp"], capture_output=True, text=True, timeout=ACTION_TIMEOUT
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    pids = []
+    for line in proc.stdout.splitlines():
+        fields = line.split()
+        if len(fields) < 4:
+            continue
+        local = fields[3]
+        if not local.rsplit(":", 1)[-1].isdigit():
+            continue
+        if int(local.rsplit(":", 1)[-1]) != port:
+            continue
+        for match in re.findall(r"pid=(\d+)", line):
+            pid = int(match)
+            if pid not in pids:
+                pids.append(pid)
+    return pids
+
+
+def pid_matches_app(pid, app):
+    """Read-only identity check: is this PID the app's own process?
+
+    Same rules as hanare-service.sh stop-app-external: owned by the
+    current user, and either its working directory is the app's
+    workdir, or its command line contains the workdir or the app's
+    exec path. Never signals anything.
+    """
+    try:
+        if os.stat("/proc/%d" % pid).st_uid != os.getuid():
+            return False
+        with open("/proc/%d/cmdline" % pid, "rb") as fh:
+            cmdline = fh.read().replace(b"\0", b" ").decode("utf-8", "replace")
+        cwd = os.readlink("/proc/%d/cwd" % pid)
+    except OSError:
+        return False
+    workdir = app.get("workdir") or ""
+    if workdir and cwd == workdir:
+        return True
+    if workdir and workdir in cmdline:
+        return True
+    argv = app.get("exec_argv") or []
+    if argv and os.path.isabs(argv[0]) and argv[0] in cmdline:
+        return True
+    return False
+
+
+def app_external_pid(app):
+    """PID of the app's externally-started instance, or None.
+
+    External = the hanare-app unit is not active, but a process
+    matching the app's identity listens on the app's URL port
+    (e.g. launched from a desktop icon in a terminal).
+    """
+    if app_is_active(app_unit(app["id"])):
+        return None
+    port = app_port(app)
+    if not port:
+        return None
+    for pid in app_listener_pids(port):
+        if pid_matches_app(pid, app):
+            return pid
+    return None
 
 
 def esc(value):
@@ -309,11 +434,16 @@ def render_page():
         for app in apps:
             unit = app_unit(app["id"])
             active = app_is_active(unit)
-            state = (
-                '<span class="st-running">起動中</span>'
-                if active
-                else '<span class="st-stopped">停止中</span>'
-            )
+            external = (not active) and app_external_pid(app) is not None
+            if active:
+                state = '<span class="st-running">起動中</span>'
+            elif external:
+                state = (
+                    '<span class="st-running">起動中</span>'
+                    ' <span class="st-degraded">管理外</span>'
+                )
+            else:
+                state = '<span class="st-stopped">停止中</span>'
             btns = (
                 '<button onclick="doApp(%s, %s)">起動</button>'
                 % (js_str(app["id"]), js_str("start"))
@@ -364,7 +494,7 @@ def render_page():
     parts.append("function doApp(id, action) {")
     parts.append("  postJSON('/app', {id: id, action: action})")
     parts.append("    .then(function (r) { return r.json().then(function (d) { return {status: r.status, d: d}; }); })")
-    parts.append("    .then(function (x) { if (x.status !== 200 || !x.d.ok) alert('app action failed: ' + (x.d.unit || id)); })")
+    parts.append("    .then(function (x) { if (x.status !== 200 || !x.d.ok) alert('app action failed: ' + (x.d.unit || id)); else if (x.d.external && x.d.external.result === 'stopped') alert('管理外のプロセスも停止しました: ' + x.d.external.detail); })")
     parts.append("    .catch(function (e) { alert('request failed: ' + e); })")
     parts.append("    .then(function () { setTimeout(function () { location.reload(); }, 1500); });")
     parts.append("}")
@@ -494,11 +624,13 @@ def render_page():
 class DashboardHandler(BaseHTTPRequestHandler):
     server_version = "HanareDash/1.0"
 
-    def _send(self, code, body, content_type="text/html; charset=utf-8"):
+    def _send(self, code, body, content_type="text/html; charset=utf-8", extra_headers=None):
         data = body.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
+        for key, value in (extra_headers or {}).items():
+            self.send_header(key, value)
         self.end_headers()
         self.wfile.write(data)
 
@@ -572,6 +704,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         payload = {"ok": ok, "unit": unit, "active": active}
         if action == "stop" and ok and service in STOP_EXTERNAL_SERVICES:
             payload["external"] = run_stop_external(service)
+        run_capture()
         self._send_json(200, payload)
 
     def _handle_app(self):
@@ -619,10 +752,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json(200, {"ok": False, "unit": unit, "error": "systemd-run failed"})
                 return
             ok = proc.returncode == 0
+            if ok:
+                run_capture()
             self._send_json(200, {"ok": ok, "unit": unit})
         else:
             ok, active = self._run_action("stop", unit)
-            self._send_json(200, {"ok": ok, "unit": unit, "active": active})
+            ext = run_stop_app_external(app["id"])
+            if ext["result"] == "stopped":
+                ok = True
+            elif ext["result"] == "none" and not app_is_active(unit):
+                # Nothing was running anywhere: stop is a no-op success.
+                ok = True
+            run_capture()
+            self._send_json(
+                200,
+                {"ok": ok, "unit": unit, "active": active, "external": ext},
+            )
 
     def _handle_model(self):
         data = self._read_json_body()
@@ -644,6 +789,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"ok": False, "error": "model CLI failed: %s" % e})
             return
         if proc.returncode == 0:
+            run_capture()
             self._send_json(200, {"ok": True, "current": name})
         else:
             err = (proc.stderr or proc.stdout or "").strip().splitlines()
@@ -655,7 +801,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/":
-            self._send(200, render_page())
+            headers = None
+            if SEEN_COOKIE not in (self.headers.get("Cookie") or ""):
+                # First load from this browser: refresh the snapshot
+                # before rendering so the page opens on live state.
+                # Later loads (including the 30 s meta refresh) carry
+                # the cookie and skip this; between opens the 60 s
+                # capture timer keeps the snapshot current.
+                run_capture()
+                headers = {
+                    "Set-Cookie": "%s=1; Path=/; SameSite=Lax" % SEEN_COOKIE
+                }
+            self._send(200, render_page(), extra_headers=headers)
         elif path in ("/action", "/model", "/app"):
             self._send_error_page(405, "method not allowed")
         else:

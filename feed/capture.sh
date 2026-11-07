@@ -16,6 +16,18 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SNAP="${HANARE_STATUS_SNAP:-$ROOT/runtime/last-status.json}"
 mkdir -p "$(dirname "$SNAP")" || exit 1
 
+# Serialize capture passes: the 60 s timer, the panel and the
+# dashboard can all trigger a capture, and two concurrent passes
+# would race on the snapshot file and double-emit events. Wait for
+# a running pass to finish (a pass takes well under a second); if
+# the lock cannot be had in 30 s, skip this pass -- the snapshot is
+# being refreshed by whoever holds the lock.
+LOCK="${HANARE_CAPTURE_LOCK:-$(dirname "$SNAP")/capture.lock}"
+exec 9>"$LOCK" || exit 1
+if ! flock -w 30 9; then
+  exit 0
+fi
+
 if [ -n "${HANARE_STATUS_INPUT:-}" ]; then
   CUR="$(cat "$HANARE_STATUS_INPUT" 2>/dev/null)" || exit 1
 else

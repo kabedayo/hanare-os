@@ -121,6 +121,7 @@ EOF
 HANARE_DASH_PORT="$DASH_PORT" \
   HANARE_SYSTEMCTL="$TMPD/stub-systemctl" \
   HANARE_SERVICE_CLI="$TMPD/stub-service" \
+  HANARE_CAPTURE_CLI=/bin/true \
   HANARE_STATUS_SNAP="$TMPD/snap.json" \
   python3 "$DASH" >"$TMPD/dash.log" 2>&1 &
 DASH_PID=$!

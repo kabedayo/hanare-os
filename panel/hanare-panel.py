@@ -28,6 +28,7 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 import urllib.parse
 
 REPO_ROOT = os.environ.get(
@@ -47,6 +48,9 @@ MODEL_CLI = os.environ.get(
 )
 SERVICE_CLI = os.environ.get(
     "HANARE_SERVICE_CLI", os.path.join(REPO_ROOT, "scripts", "hanare-service.sh")
+)
+CAPTURE_CLI = os.environ.get(
+    "HANARE_CAPTURE_CLI", os.path.join(REPO_ROOT, "feed", "capture.sh")
 )
 ACTION_TIMEOUT = 15
 
@@ -611,10 +615,10 @@ def add_model(form):
     return True, "モデル「%s」を追加しました" % name
 
 
-def run_cmd(argv):
+def run_cmd(argv, timeout=ACTION_TIMEOUT):
     try:
         proc = subprocess.run(
-            argv, capture_output=True, text=True, timeout=ACTION_TIMEOUT
+            argv, capture_output=True, text=True, timeout=timeout
         )
         return proc.returncode == 0
     except (OSError, subprocess.SubprocessError):
@@ -634,6 +638,76 @@ def unit_is_active(unit):
     return proc.stdout.strip() == "active"
 
 
+def app_listener_pids(port):
+    """PIDs listening on a TCP port (via ss), best effort."""
+    try:
+        proc = subprocess.run(
+            ["ss", "-tlnp"], capture_output=True, text=True, timeout=ACTION_TIMEOUT
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    pids = []
+    for line in proc.stdout.splitlines():
+        fields = line.split()
+        if len(fields) < 4:
+            continue
+        local = fields[3]
+        if not local.rsplit(":", 1)[-1].isdigit():
+            continue
+        if int(local.rsplit(":", 1)[-1]) != port:
+            continue
+        for match in re.findall(r"pid=(\d+)", line):
+            pid = int(match)
+            if pid not in pids:
+                pids.append(pid)
+    return pids
+
+
+def pid_matches_app(pid, app):
+    """Read-only identity check: is this PID the app's own process?
+
+    Same rules as hanare-service.sh stop-app-external: owned by the
+    current user, and either its working directory is the app's
+    workdir, or its command line contains the workdir or the app's
+    exec path. Never signals anything.
+    """
+    try:
+        if os.stat("/proc/%d" % pid).st_uid != os.getuid():
+            return False
+        with open("/proc/%d/cmdline" % pid, "rb") as fh:
+            cmdline = fh.read().replace(b"\0", b" ").decode("utf-8", "replace")
+        cwd = os.readlink("/proc/%d/cwd" % pid)
+    except OSError:
+        return False
+    workdir = app.get("workdir") or ""
+    if workdir and cwd == workdir:
+        return True
+    if workdir and workdir in cmdline:
+        return True
+    argv = app.get("exec_argv") or []
+    if argv and os.path.isabs(argv[0]) and argv[0] in cmdline:
+        return True
+    return False
+
+
+def app_external_pid(app):
+    """PID of the app's externally-started instance, or None.
+
+    An instance is external when its hanare-app unit is not active
+    (callers check that) but a process matching the app's identity
+    listens on the app's URL port -- e.g. the app was launched from
+    a desktop icon in a terminal, where `systemctl stop` cannot
+    see it.
+    """
+    port = port_from_url(app.get("url"))
+    if not port:
+        return None
+    for pid in app_listener_pids(port):
+        if pid_matches_app(pid, app):
+            return pid
+    return None
+
+
 def scan_apps():
     if discover is None:
         return []
@@ -650,6 +724,9 @@ def scan_apps():
     for app in found:
         item = dict(app)
         item["active"] = unit_is_active(app_unit(app["id"]))
+        item["external"] = (
+            not item["active"] and app_external_pid(item) is not None
+        )
         result.append(item)
     return result
 
@@ -762,7 +839,15 @@ def do_app_action(app, action):
         cmd.extend(app.get("exec_argv") or [])
         return run_cmd(cmd)
     if action == "stop":
-        return run_cmd([SYSTEMCTL, "--user", "stop", unit])
+        if unit_is_active(unit):
+            run_cmd([SYSTEMCTL, "--user", "stop", unit])
+        # An instance started outside the unit (terminal/desktop)
+        # is invisible to systemctl; reap it through the helper,
+        # which only ever TERMs a listener on the app's own port
+        # whose cwd/cmdline matches the app. Exit 3 (none found)
+        # is the normal case for unit-managed apps.
+        run_cmd([SERVICE_CLI, "stop-app-external", app["id"]], timeout=40)
+        return not unit_is_active(unit)
     return False
 
 
@@ -872,6 +957,40 @@ def build_window(app):
     win = Gtk.ApplicationWindow(application=app)
     win.set_title("HANARE")
     win.set_default_size(920, 680)
+
+    # Update policy: the snapshot is refreshed by the 60 s capture
+    # timer in the background, and this window re-reads it every
+    # 60 s. On top of that, opening the panel and every user action
+    # run one capture pass immediately (in a thread, so the UI never
+    # freezes) and refresh as soon as it lands. capture.sh itself
+    # flock-serializes passes, and the flags below coalesce bursts.
+    capture_state = {"running": False, "pending": False}
+
+    def capture_now_async():
+        if capture_state["running"]:
+            capture_state["pending"] = True
+            return
+        capture_state["running"] = True
+
+        def _work():
+            try:
+                subprocess.run(
+                    ["/usr/bin/bash", CAPTURE_CLI],
+                    capture_output=True,
+                    timeout=60,
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
+            capture_state["running"] = False
+            again = capture_state["pending"]
+            capture_state["pending"] = False
+            GLib.idle_add(refresh)
+            if again:
+                GLib.idle_add(capture_now_async)
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    win.capture_now_async = capture_now_async
 
     provider = Gtk.CssProvider()
     provider.load_from_data(CSS.encode("utf-8"))
@@ -1287,7 +1406,7 @@ def build_window(app):
                 action_button(
                     "再起動",
                     True,
-                    lambda _b, n=name: (do_service_action(n, "restart"), refresh()),
+                    lambda _b, n=name: (do_service_action(n, "restart"), capture_now_async()),
                 ),
                 False, False, 0,
             )
@@ -1296,7 +1415,7 @@ def build_window(app):
                     action_button(
                         "停止",
                         True,
-                        lambda _b, n=name: (do_service_action(n, "stop"), refresh()),
+                        lambda _b, n=name: (do_service_action(n, "stop"), capture_now_async()),
                     ),
                     False, False, 0,
                 )
@@ -1305,7 +1424,7 @@ def build_window(app):
                     action_button(
                         "起動",
                         True,
-                        lambda _b, n=name: (do_service_action(n, "start"), refresh()),
+                        lambda _b, n=name: (do_service_action(n, "start"), capture_now_async()),
                         accent=True,
                     ),
                     False, False, 0,
@@ -1363,7 +1482,7 @@ def build_window(app):
                     action_button(
                         "選択",
                         True,
-                        lambda _b, n=model["name"]: (do_model_select(n), refresh()),
+                        lambda _b, n=model["name"]: (do_model_select(n), capture_now_async()),
                     ),
                     False, False, 0,
                 )
@@ -1434,7 +1553,11 @@ def build_window(app):
             hint.get_style_context().add_class("drag-hint")
             row.pack_start(hint, False, False, 0)
             row.pack_start(
-                dot_label("running" if app_item["active"] else "stopped"),
+                dot_label(
+                    "running"
+                    if app_item["active"] or app_item.get("external")
+                    else "stopped"
+                ),
                 False, False, 0,
             )
             texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -1443,12 +1566,14 @@ def build_window(app):
             )
             name_label.get_style_context().add_class("name")
             texts.pack_start(name_label, False, False, 0)
+            if app_item["active"]:
+                app_state_text = "起動中"
+            elif app_item.get("external"):
+                app_state_text = "起動中 · 管理外"
+            else:
+                app_state_text = "停止中"
             meta = Gtk.Label(
-                label="%s · %s"
-                % (
-                    app_item.get("source", ""),
-                    "起動中" if app_item["active"] else "停止中",
-                ),
+                label="%s · %s" % (app_item.get("source", ""), app_state_text),
                 xalign=0,
             )
             meta.get_style_context().add_class("meta")
@@ -1512,12 +1637,12 @@ def build_window(app):
             eb.connect("drag-data-get", on_app_drag_data_get)
             eb.connect("drag-end", on_app_drag_end)
             eb.add(row)
-            if app_item["active"]:
+            if app_item["active"] or app_item.get("external"):
                 row.pack_end(
                     action_button(
                         "停止",
                         True,
-                        lambda _b, a=app_item: (do_app_action(a, "stop"), refresh()),
+                        lambda _b, a=app_item: (do_app_action(a, "stop"), capture_now_async()),
                     ),
                     False, False, 0,
                 )
@@ -1526,7 +1651,7 @@ def build_window(app):
                     action_button(
                         "起動",
                         True,
-                        lambda _b, a=app_item: (do_app_action(a, "start"), refresh()),
+                        lambda _b, a=app_item: (do_app_action(a, "start"), capture_now_async()),
                         accent=True,
                     ),
                     False, False, 0,
@@ -1562,7 +1687,8 @@ def build_window(app):
         return True
 
     refresh()
-    GLib.timeout_add_seconds(5, refresh)
+    capture_now_async()
+    GLib.timeout_add_seconds(60, refresh)
     win.show_all()
     return win
 
@@ -1587,6 +1713,10 @@ def main():
             win = self.get_active_window()
             if win is None:
                 win = build_window(self)
+            else:
+                capture_now = getattr(win, "capture_now_async", None)
+                if capture_now is not None:
+                    capture_now()
             win.present()
 
     return PanelApp().run(sys.argv)
