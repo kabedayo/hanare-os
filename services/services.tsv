@@ -5,3 +5,4 @@
 llama-server	8080	Tesla V100	llama	hanare-llama	-	-	-
 comfyui	8188	Tesla V100	ComfyUI	hanare-comfyui	-	-	http://127.0.0.1:8188/
 strata	8095	Tesla V100	Strata	hanare-strata	/usr/bin/bash %h/hanare-os/scripts/hanare-strata-run.sh	-	http://127.0.0.1:8095/
+local-story-studio	8765	-	Local Story Studio	hanare-local-story-studio	/home/kabe/Documents/Codex/2026-10-11/ubuntu-llm-comfyui-llm-comfyui-llm-2/outputs/story-studio/run.sh	/home/kabe/Documents/Codex/2026-10-11/ubuntu-llm-comfyui-llm-comfyui-llm-2/outputs/story-studio	http://127.0.0.1:8765/
