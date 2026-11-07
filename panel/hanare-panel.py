@@ -10,6 +10,9 @@ for service name -> unit/display/exec), systemd-run --user for apps,
 scripts/hanare-model.sh for model selection. No shell is ever invoked.
 The settings card at the bottom edits that registry (services and new
 models) and regenerates units via scripts/hanare-service-gen.sh.
+Its form can be prefilled from a desktop launcher (.desktop) picked
+in the settings card; the launcher helpers are pure and are also
+exposed in the --dump output as "launchers".
 
 Usage:
   hanare-panel.py           open the window
@@ -19,6 +22,7 @@ Usage:
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 
@@ -92,6 +96,130 @@ def apps_dirs():
             if d.strip()
         ]
     return apps_dir, drop_dir, desktop_dirs
+
+
+LAUNCHER_FIELD_CODE_RE = re.compile(r"%[fFuUdDnNickVm]|%")
+LAUNCHER_SLUG_RE = re.compile(r"[^a-z0-9]+")
+LAUNCHER_WRAPPER_NAMES = (
+    "gnome-terminal", "gnome-terminal.real", "xdg-open", "nohup", "steam",
+)
+
+
+def launcher_dirs():
+    """Desktop launcher folders scanned by the settings-card picker."""
+    raw = os.environ.get("HANARE_LAUNCHER_DIRS") or os.environ.get(
+        "HANARE_DESKTOP_DIRS"
+    )
+    if raw:
+        return [
+            os.path.expanduser(d.strip()) for d in raw.split(":") if d.strip()
+        ]
+    return [
+        os.path.expanduser("~/Desktop"),
+        os.path.expanduser("~/\u30c7\u30b9\u30af\u30c8\u30c3\u30d7"),
+        os.path.expanduser("~/.local/share/applications"),
+    ]
+
+
+def launcher_id_suggestion(stem):
+    """Slug for a service name from a .desktop file name stem."""
+    return LAUNCHER_SLUG_RE.sub("-", stem.lower()).strip("-")
+
+
+def _systemd_quote(arg):
+    if arg == "":
+        return '\"\"'
+    if re.search(r"[\s\"'\\$`]", arg):
+        return '"' + arg.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return arg
+
+
+def launcher_exec_argv(exec_value):
+    """Strip .desktop field codes and split an Exec value with shlex."""
+    cleaned = LAUNCHER_FIELD_CODE_RE.sub("", exec_value or "")
+    try:
+        argv = shlex.split(cleaned)
+    except ValueError:
+        return None
+    return argv or None
+
+
+def launcher_wrapper_token(argv):
+    """Return the wrapper program name found in argv, or None."""
+    for token in argv or []:
+        base = os.path.basename(token)
+        if base in LAUNCHER_WRAPPER_NAMES:
+            return base
+    return None
+
+
+def parse_desktop_file(path):
+    """Parse one .desktop launcher into a settings-form dict (or None)."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    values = {}
+    section = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip()
+            continue
+        if section != "Desktop Entry" or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if key not in values:
+            values[key] = value.strip()
+    type_value = values.get("Type")
+    if type_value is not None and type_value != "Application":
+        return None
+    name = values.get("Name")
+    exec_value = values.get("Exec")
+    if not name or not exec_value:
+        return None
+    if values.get("Hidden", "").lower() == "true":
+        return None
+    if values.get("NoDisplay", "").lower() == "true":
+        return None
+    argv = launcher_exec_argv(exec_value)
+    if not argv:
+        return None
+    stem = os.path.splitext(os.path.basename(str(path)))[0]
+    return {
+        "name": name,
+        "exec": " ".join(_systemd_quote(a) for a in argv),
+        "exec_argv": argv,
+        "workdir": values.get("Path") or "",
+        "file": str(path),
+        "id_suggestion": launcher_id_suggestion(stem),
+        "wrapper": launcher_wrapper_token(argv),
+    }
+
+
+def scan_launchers(dirs=None):
+    """Scan launcher folders; the first file with a given name wins."""
+    if dirs is None:
+        dirs = launcher_dirs()
+    results = []
+    seen = set()
+    for folder in dirs:
+        try:
+            names = sorted(os.listdir(folder))
+        except OSError:
+            continue
+        for fname in names:
+            if not fname.endswith(".desktop") or fname in seen:
+                continue
+            seen.add(fname)
+            item = parse_desktop_file(os.path.join(folder, fname))
+            if item is not None:
+                results.append(item)
+    return results
 
 
 def load_snapshot():
@@ -432,6 +560,7 @@ def collect_model():
         "memory": snap.get("memory") or {},
         "services": services,
         "registry": load_service_registry(),
+        "launchers": scan_launchers(),
         "models": load_models(),
         "current_model": current_model(),
         "apps": scan_apps(),
@@ -701,6 +830,52 @@ def build_window(app):
         row_box.pack_start(entry, True, True, 0)
         parent.pack_start(row_box, False, False, 0)
         return entry
+
+    launcher_items = scan_launchers()
+    launcher_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    launcher_row.get_style_context().add_class("row")
+    launcher_lab = Gtk.Label(label="アイコンから選ぶ", xalign=0)
+    launcher_lab.set_size_request(110, -1)
+    launcher_lab.get_style_context().add_class("meta")
+    launcher_row.pack_start(launcher_lab, False, False, 0)
+    launcher_combo = Gtk.ComboBoxText()
+    launcher_combo.append("", "（デスクトップのアイコン）")
+    for _i, _item in enumerate(launcher_items):
+        launcher_combo.append(str(_i), _item["name"])
+    launcher_combo.set_active(0)
+    launcher_row.pack_start(launcher_combo, True, True, 0)
+    launcher_warn = Gtk.Label(label="", xalign=0)
+    launcher_warn.set_line_wrap(True)
+    launcher_warn.get_style_context().add_class("meta")
+
+    def on_load_launcher(_button):
+        active_id = launcher_combo.get_active_id()
+        if not active_id:
+            settings_status.set_text("先にアイコンを選んでください")
+            return
+        item = launcher_items[int(active_id)]
+        svc_entries["display"].set_text(item["name"])
+        svc_entries["exec"].set_text(item["exec"])
+        svc_entries["workdir"].set_text(item["workdir"] or "")
+        if not svc_entries["name"].get_text().strip() and item["id_suggestion"]:
+            svc_entries["name"].set_text(item["id_suggestion"])
+        if item["wrapper"]:
+            launcher_warn.set_text(
+                "注意: 起動コマンドに %s が含まれます。人間用ラッパー（端末やブラウザを開く係）の可能性があります。サービス本体のコマンドか確認してください。"
+                % item["wrapper"]
+            )
+        else:
+            launcher_warn.set_text("")
+        settings_status.set_text(
+            "アイコン「%s」を読み込みました（ポートとURLは手入力です）"
+            % item["name"]
+        )
+
+    launcher_btn = Gtk.Button(label="読み込む")
+    launcher_btn.connect("clicked", on_load_launcher)
+    launcher_row.pack_start(launcher_btn, False, False, 0)
+    settings_card.pack_start(launcher_row, False, False, 0)
+    settings_card.pack_start(launcher_warn, False, False, 0)
 
     svc_entries = {
         "name": labeled_entry("サービス名（英小文字）", settings_card),
