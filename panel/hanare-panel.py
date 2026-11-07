@@ -178,6 +178,17 @@ def port_from_url(url):
     return port if port and 1 <= port <= 65535 else None
 
 
+def auto_url_for_port(port):
+    """Default service URL for a port: http://127.0.0.1:<port>/ (or '')."""
+    try:
+        pnum = int(str(port).strip())
+    except (TypeError, ValueError):
+        return ""
+    if 1 <= pnum <= 65535:
+        return "http://127.0.0.1:%d/" % pnum
+    return ""
+
+
 def app_to_service_prefill(app, registry_names=None):
     """Map a discovered app dict to a service-form prefill dict.
 
@@ -449,6 +460,8 @@ def upsert_service(form):
         return False, "ポートは数値で入力してください"
     if not (1 <= port <= 65535):
         return False, "ポートは 1〜65535 で入力してください"
+    if url == "-":
+        url = auto_url_for_port(port) or "-"
     for value in (display, exec_cmd, workdir, url):
         if "\t" in value or "\n" in value:
             return False, "タブや改行は使えません"
@@ -949,6 +962,20 @@ def build_window(app):
     svc_entries["exec"].set_placeholder_text(
         "例: python3 -m http.server 8899 --bind 127.0.0.1（空欄 = 手管理ユニット）"
     )
+    svc_entries["url"].set_placeholder_text(
+        "空欄ならポートから自動入力（例: http://127.0.0.1:8765/）"
+    )
+    url_auto_state = {"last": ""}
+
+    def on_port_changed(_entry):
+        current_url = svc_entries["url"].get_text()
+        if current_url == "" or current_url == url_auto_state["last"]:
+            new_url = auto_url_for_port(svc_entries["port"].get_text())
+            url_auto_state["last"] = new_url
+            if current_url != new_url:
+                svc_entries["url"].set_text(new_url)
+
+    svc_entries["port"].connect("changed", on_port_changed)
     settings_status = Gtk.Label(label="", xalign=0)
     settings_status.get_style_context().add_class("meta")
 
