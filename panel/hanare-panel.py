@@ -1246,6 +1246,9 @@ def build_window(app):
         for app_item in data["apps"]:
             row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
             row.get_style_context().add_class("row")
+            hint = Gtk.Label(label="\u2261")
+            hint.get_style_context().add_class("drag-hint")
+            row.pack_start(hint, False, False, 0)
             row.pack_start(
                 dot_label("running" if app_item["active"] else "stopped"),
                 False, False, 0,
@@ -1267,9 +1270,6 @@ def build_window(app):
             meta.get_style_context().add_class("meta")
             texts.pack_start(meta, False, False, 0)
             row.pack_start(texts, True, True, 0)
-            hint = Gtk.Label(label="\u2261")
-            hint.get_style_context().add_class("drag-hint")
-            row.pack_start(hint, False, False, 0)
             row.set_tooltip_text(
                 "「サービス」カードへドラッグすると、サービス登録フォームに取り込めます"
             )
