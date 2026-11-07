@@ -530,6 +530,58 @@ def remove_service(name):
     return True, "サービス「%s」を削除しました" % name
 
 
+def demote_service_to_app(name):
+    """Move a registry service back to an app.
+
+    Writes apps.d/<name>.app (unless one already exists) from the
+    registry row, then removes the registry row (which also removes
+    the generated unit). Hand-managed services (exec "-") have no
+    command to run as an app and are refused. Returns (ok, message).
+    """
+    rows = load_service_registry()
+    target = None
+    for row in rows:
+        if row["name"] == name:
+            target = row
+            break
+    if target is None:
+        return False, "サービスが見つかりません: %s" % name
+    exec_cmd = (target.get("exec") or "").strip()
+    if exec_cmd in ("", "-"):
+        return False, (
+            "サービス「%s」は起動コマンドを持たない（手管理ユニット）ため、"
+            "アプリへ下ろせません" % name
+        )
+    apps_dir, _drop_dir, _desktop_dirs = apps_dirs()
+    app_path = os.path.join(apps_dir, name + ".app")
+    wrote = False
+    if not os.path.exists(app_path):
+        lines = [
+            "name=%s" % (target.get("display") or name),
+            "exec=%s" % exec_cmd,
+        ]
+        workdir = (target.get("workdir") or "").strip()
+        if workdir and workdir != "-":
+            lines.append("workdir=%s" % workdir)
+        url = (target.get("url") or "").strip()
+        if url and url != "-":
+            lines.append("url=%s" % url)
+        lines.append("note=サービスから下ろしたアプリ")
+        try:
+            os.makedirs(apps_dir, exist_ok=True)
+            with open(app_path, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(lines) + "\n")
+            wrote = True
+        except OSError as exc:
+            return False, "アプリ定義の保存に失敗しました: %s" % exc
+    ok, _msg = remove_service(name)
+    if not ok:
+        return False, "サービス登録の解除に失敗しました（アプリ定義は作成済みです）"
+    if wrote:
+        return True, "サービス「%s」をアプリへ下ろしました" % name
+    return True, "サービス「%s」を解除しました（アプリ定義は既存のものを使います）" % name
+
+
 def add_model(form):
     """Append one row to models/models.tsv. Returns (ok, message)."""
     name = (form.get("name") or "").strip()
@@ -983,6 +1035,7 @@ def build_window(app):
     settings_status.get_style_context().add_class("meta")
 
     drag_state = {"active": False, "pressed": False}
+    demote_state = {"text": ""}
 
     def scroll_to_settings():
         def _do():
@@ -1148,6 +1201,7 @@ def build_window(app):
 
         clear(dynamic)
 
+        reg_map = {r["name"]: r for r in load_service_registry()}
         svc_card = make_card("サービス")
         svc_eb = Gtk.EventBox()
         svc_eb.get_style_context().add_class("dnd-wrap")
@@ -1175,7 +1229,11 @@ def build_window(app):
             widget, context, _x, _y, selection, _info, time
         ):
             svc_card.get_style_context().remove_class("drop-active")
-            app_id = (selection.get_text() or "").strip()
+            payload = (selection.get_text() or "").strip()
+            if payload.startswith("svc:"):
+                Gtk.drag_finish(context, False, False, time)
+                return
+            app_id = payload[4:] if payload.startswith("app:") else payload
             found = None
             for candidate in data["apps"]:
                 if candidate.get("id") == app_id:
@@ -1189,7 +1247,7 @@ def build_window(app):
         svc_eb.connect("drag-leave", on_svc_drag_leave)
         svc_eb.connect("drag-data-received", on_svc_drag_data_received)
         svc_hint = Gtk.Label(
-            label="ヒント: 下の「アプリ」の行をここへドラッグ（またはアプリの行をクリック）すると、サービス登録フォームに取り込めます",
+            label="ヒント: 下の「アプリ」の行をここへドラッグ（またはアプリの行をクリック）すると、サービス登録フォームに取り込めます。サービスの行は下の「アプリ」へドラッグすると下ろせます",
             xalign=0,
         )
         svc_hint.get_style_context().add_class("meta")
@@ -1199,6 +1257,12 @@ def build_window(app):
             state = svc.get("state") or "stopped"
             row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
             row.get_style_context().add_class("row")
+            _reg_row = reg_map.get(name) or {}
+            demotable = (_reg_row.get("exec") or "-") != "-"
+            if demotable:
+                hint = Gtk.Label(label="\u2261")
+                hint.get_style_context().add_class("drag-hint")
+                row.pack_start(hint, False, False, 0)
             row.pack_start(dot_label(state), False, False, 0)
             texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
             name_label = Gtk.Label(label=name, xalign=0)
@@ -1246,7 +1310,36 @@ def build_window(app):
                     ),
                     False, False, 0,
                 )
-            svc_card.pack_start(row, False, False, 0)
+            if demotable:
+                seb = Gtk.EventBox()
+                seb.get_style_context().add_class("dnd-wrap")
+                seb.set_visible_window(True)
+                seb.set_tooltip_text(
+                    "下の「アプリ」カードへドラッグすると、サービス登録を解除してアプリへ下ろせます（稼働中は不可）"
+                )
+                seb.drag_source_set(
+                    Gdk.ModifierType.BUTTON1_MASK,
+                    [Gtk.TargetEntry.new("text/plain", Gtk.TargetFlags.SAME_APP, 0)],
+                    Gdk.DragAction.COPY,
+                )
+
+                def on_svc_drag_begin(_w, _c):
+                    drag_state["active"] = True
+
+                def on_svc_drag_data_get(_w, _c, selection, _i, _t, _n=name):
+                    selection.set_text("svc:" + _n, -1)
+
+                def on_svc_drag_end(_w, _c):
+                    drag_state["active"] = False
+                    drag_state["pressed"] = False
+
+                seb.connect("drag-begin", on_svc_drag_begin)
+                seb.connect("drag-data-get", on_svc_drag_data_get)
+                seb.connect("drag-end", on_svc_drag_end)
+                seb.add(row)
+                svc_card.pack_start(seb, False, False, 0)
+            else:
+                svc_card.pack_start(row, False, False, 0)
 
         model_card = make_card("モデル（選択すると llama が再起動します）")
         for model in data["models"]:
@@ -1281,6 +1374,59 @@ def build_window(app):
             model_card.pack_start(empty, False, False, 0)
 
         app_card = make_card("アプリ")
+        app_eb = Gtk.EventBox()
+        app_eb.get_style_context().add_class("dnd-wrap")
+        app_eb.set_visible_window(True)
+        _app_parent = app_card.get_parent()
+        _app_parent.remove(app_card)
+        app_eb.add(app_card)
+        _app_parent.pack_start(app_eb, False, False, 0)
+        app_eb.drag_dest_set(
+            Gtk.DestDefaults.ALL,
+            [Gtk.TargetEntry.new("text/plain", Gtk.TargetFlags.SAME_APP, 0)],
+            Gdk.DragAction.COPY,
+        )
+
+        def on_app_dest_motion(widget, context, _x, _y, time):
+            app_card.get_style_context().add_class("drop-active")
+            Gdk.drag_status(context, Gdk.DragAction.COPY, time)
+            return True
+
+        def on_app_dest_leave(widget, _context, _time):
+            app_card.get_style_context().remove_class("drop-active")
+
+        def on_app_dest_data_received(
+            widget, context, _x, _y, selection, _info, time
+        ):
+            app_card.get_style_context().remove_class("drop-active")
+            payload = (selection.get_text() or "").strip()
+            ok = False
+            if payload.startswith("svc:"):
+                svc_name = payload[4:]
+                svc_entry = None
+                for cand in data["services"]:
+                    if cand.get("name") == svc_name:
+                        svc_entry = cand
+                        break
+                if svc_entry is not None:
+                    svc_state = svc_entry.get("state") or "stopped"
+                    if svc_state in ("running", "degraded", "stuck-suspect"):
+                        demote_state["text"] = (
+                            "サービス「%s」は稼働中のため下ろせません。先に停止してください"
+                            % svc_name
+                        )
+                    else:
+                        ok, demote_state["text"] = demote_service_to_app(svc_name)
+            Gtk.drag_finish(context, ok, False, time)
+            refresh()
+
+        app_eb.connect("drag-motion", on_app_dest_motion)
+        app_eb.connect("drag-leave", on_app_dest_leave)
+        app_eb.connect("drag-data-received", on_app_dest_data_received)
+        if demote_state.get("text"):
+            demote_label = Gtk.Label(label=demote_state["text"], xalign=0)
+            demote_label.get_style_context().add_class("meta")
+            app_card.pack_start(demote_label, False, False, 0)
         for app_item in data["apps"]:
             row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
             row.get_style_context().add_class("row")
@@ -1354,7 +1500,7 @@ def build_window(app):
                 _widget, _context, selection, _info, _time,
                 _aid=app_item["id"],
             ):
-                selection.set_text(_aid, -1)
+                selection.set_text("app:" + _aid, -1)
 
             def on_app_drag_end(_widget, _context):
                 drag_state["active"] = False
