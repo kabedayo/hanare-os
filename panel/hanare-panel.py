@@ -13,6 +13,9 @@ models) and regenerates units via scripts/hanare-service-gen.sh.
 Its form can be prefilled from a desktop launcher (.desktop) picked
 in the settings card; the launcher helpers are pure and are also
 exposed in the --dump output as "launchers".
+Apps listed in the apps card can be dragged onto the services card;
+the drop only prefills the settings form (app_to_service_prefill)
+and nothing is registered until the user presses save.
 
 Usage:
   hanare-panel.py           open the window
@@ -25,6 +28,7 @@ import re
 import shlex
 import subprocess
 import sys
+import urllib.parse
 
 REPO_ROOT = os.environ.get(
     "HANARE_REPO",
@@ -151,6 +155,55 @@ def launcher_wrapper_token(argv):
         if base in LAUNCHER_WRAPPER_NAMES:
             return base
     return None
+
+
+
+APP_ID_SLUG_RE = re.compile(r"[^a-z0-9]+")
+
+
+def service_id_from_app_id(raw):
+    """Normalize an app id into a registry service name (or '')."""
+    slug = APP_ID_SLUG_RE.sub("-", (raw or "").lower()).strip("-")
+    return slug if SERVICE_ID_RE.match(slug) else ""
+
+
+def port_from_url(url):
+    """Extract the port from a URL like http://127.0.0.1:8765/ (or None)."""
+    if not url or url == "-":
+        return None
+    try:
+        port = urllib.parse.urlparse(url).port
+    except ValueError:
+        return None
+    return port if port and 1 <= port <= 65535 else None
+
+
+def app_to_service_prefill(app, registry_names=None):
+    """Map a discovered app dict to a service-form prefill dict.
+
+    Pure: registry_names may be passed in for collision checks; when
+    omitted the on-disk registry is read. Nothing is written here:
+    the user still reviews the form and presses save.
+    """
+    name = service_id_from_app_id(app.get("id") or "")
+    argv = app.get("exec_argv") or []
+    if not argv and app.get("exec"):
+        argv = launcher_exec_argv(app["exec"]) or []
+    exec_text = app.get("exec") or " ".join(_systemd_quote(a) for a in argv)
+    url = app.get("url") or ""
+    port = port_from_url(url)
+    if registry_names is None:
+        registry_names = {row["name"] for row in load_service_registry()}
+    return {
+        "name": name,
+        "display": app.get("name") or name,
+        "port": str(port) if port else "",
+        "exec": exec_text,
+        "workdir": app.get("workdir") or "",
+        "url": "" if url == "-" else url,
+        "conflict": bool(name) and name in registry_names,
+        "wrapper": launcher_wrapper_token(argv),
+    }
 
 
 def parse_desktop_file(path):
@@ -726,6 +779,14 @@ button.accent {
 button.accent:hover {
     background-color: #c55040;
 }
+.card.drop-active {
+    border: 2px solid #b54434;
+    background-color: #fdf3ec;
+}
+.drag-hint {
+    color: #a39c8a;
+    font-size: 13px;
+}
 .sep {
     background-color: #e3dac4;
     min-height: 1px;
@@ -738,7 +799,7 @@ def build_window(app):
     import gi
 
     gi.require_version("Gtk", "3.0")
-    from gi.repository import GLib, Gtk
+    from gi.repository import Gdk, GLib, Gtk
 
     win = Gtk.ApplicationWindow(application=app)
     win.set_title("HANARE")
@@ -891,6 +952,50 @@ def build_window(app):
     settings_status = Gtk.Label(label="", xalign=0)
     settings_status.get_style_context().add_class("meta")
 
+    drag_state = {"active": False}
+
+    def scroll_to_settings():
+        def _do():
+            try:
+                coords = settings_card.translate_coordinates(content, 0, 0)
+                if coords is not None:
+                    adj = scroller.get_vadjustment()
+                    target = coords[1] - 8
+                    upper = adj.get_upper() - adj.get_page_size()
+                    adj.set_value(max(0.0, min(target, max(upper, 0.0))))
+            except Exception:
+                pass
+            return False
+
+        GLib.idle_add(_do)
+
+    def apply_app_prefill(app_item):
+        pre = app_to_service_prefill(app_item)
+        svc_entries["name"].set_text(pre["name"])
+        svc_entries["display"].set_text(pre["display"])
+        svc_entries["port"].set_text(pre["port"])
+        svc_entries["exec"].set_text(pre["exec"])
+        svc_entries["workdir"].set_text(pre["workdir"])
+        svc_entries["url"].set_text(pre["url"])
+        if pre["wrapper"]:
+            launcher_warn.set_text(
+                "注意: 起動コマンドに %s が含まれます。人間用ラッパー（端末やブラウザを開く係）の可能性があります。サービス本体のコマンドか確認してください。"
+                % pre["wrapper"]
+            )
+        else:
+            launcher_warn.set_text("")
+        if pre["conflict"]:
+            settings_status.set_text(
+                "アプリ「%s」を取り込みました。サービス名「%s」は既に登録済みのため編集として扱います。内容を確認して保存してください"
+                % (pre["display"], pre["name"])
+            )
+        else:
+            settings_status.set_text(
+                "アプリ「%s」を取り込みました。内容を確認して保存してください"
+                % pre["display"]
+            )
+        scroll_to_settings()
+
     def fill_service_form(row):
         svc_entries["name"].set_text(row.get("name") or "")
         svc_entries["display"].set_text(row.get("display") or "")
@@ -983,6 +1088,10 @@ def build_window(app):
         settings_list.show_all()
 
     def refresh(*_args):
+        if drag_state["active"]:
+            # A drag is in flight: rebuilding now would destroy the
+            # drag source mid-gesture. Skip this cycle only.
+            return True
         data = collect_model()
         worst = worst_state(data["services"])
         header_dot.set_markup(
@@ -1010,6 +1119,43 @@ def build_window(app):
         clear(dynamic)
 
         svc_card = make_card("サービス")
+        svc_card.drag_dest_set(
+            Gtk.DestDefaults.ALL,
+            [Gtk.TargetEntry.new("text/plain", Gtk.TargetFlags.SAME_APP, 0)],
+            Gdk.DragAction.COPY,
+        )
+
+        def on_svc_drag_motion(widget, context, _x, _y, time):
+            widget.get_style_context().add_class("drop-active")
+            Gdk.drag_status(context, Gdk.DragAction.COPY, time)
+            return True
+
+        def on_svc_drag_leave(widget, _context, _time):
+            widget.get_style_context().remove_class("drop-active")
+
+        def on_svc_drag_data_received(
+            widget, context, _x, _y, selection, _info, time
+        ):
+            widget.get_style_context().remove_class("drop-active")
+            app_id = (selection.get_text() or "").strip()
+            found = None
+            for candidate in data["apps"]:
+                if candidate.get("id") == app_id:
+                    found = candidate
+                    break
+            if found is not None:
+                apply_app_prefill(found)
+            Gtk.drag_finish(context, found is not None, False, time)
+
+        svc_card.connect("drag-motion", on_svc_drag_motion)
+        svc_card.connect("drag-leave", on_svc_drag_leave)
+        svc_card.connect("drag-data-received", on_svc_drag_data_received)
+        svc_hint = Gtk.Label(
+            label="ヒント: 下の「アプリ」の行をここへドラッグすると、サービス登録フォームに取り込めます",
+            xalign=0,
+        )
+        svc_hint.get_style_context().add_class("meta")
+        svc_card.pack_start(svc_hint, False, False, 0)
         for svc in data["services"]:
             name = svc["name"]
             state = svc.get("state") or "stopped"
@@ -1121,6 +1267,33 @@ def build_window(app):
             meta.get_style_context().add_class("meta")
             texts.pack_start(meta, False, False, 0)
             row.pack_start(texts, True, True, 0)
+            hint = Gtk.Label(label="\u2261")
+            hint.get_style_context().add_class("drag-hint")
+            row.pack_start(hint, False, False, 0)
+            row.set_tooltip_text(
+                "「サービス」カードへドラッグすると、サービス登録フォームに取り込めます"
+            )
+            row.drag_source_set(
+                Gdk.ModifierType.BUTTON1_MASK,
+                [Gtk.TargetEntry.new("text/plain", Gtk.TargetFlags.SAME_APP, 0)],
+                Gdk.DragAction.COPY,
+            )
+
+            def on_app_drag_begin(_widget, _context, _aid=app_item["id"]):
+                drag_state["active"] = True
+
+            def on_app_drag_data_get(
+                _widget, _context, selection, _info, _time,
+                _aid=app_item["id"],
+            ):
+                selection.set_text(_aid, -1)
+
+            def on_app_drag_end(_widget, _context):
+                drag_state["active"] = False
+
+            row.connect("drag-begin", on_app_drag_begin)
+            row.connect("drag-data-get", on_app_drag_data_get)
+            row.connect("drag-end", on_app_drag_end)
             if app_item["active"]:
                 row.pack_end(
                     action_button(
