@@ -161,6 +161,54 @@ def launcher_wrapper_token(argv):
     return None
 
 
+SCRIPT_WRAPPER_STRONG = (
+    "gnome-terminal", "konsole", "xterm", "gtk-launch", "webbrowser",
+)
+SCRIPT_WRAPPER_WEAK = (
+    "xdg-open", "sensible-browser", "nohup", "setsid", "disown",
+)
+FOREGROUND_SIGN_RE = re.compile(r"(?m)^\s*(exec\s|wait\b|fg\b|sleep\s+infinity)")
+
+
+def script_wrapper_token(argv):
+    """Peek inside the script a command runs, looking for wrapper signs.
+
+    Desktop launchers often hide the wrapper one level down: the Exec
+    line runs a .py/.sh whose job is to open a terminal or browser and
+    exit (e.g. launch-desktop.py). Such a command makes a poor systemd
+    service, which needs a process that stays in the foreground.
+
+    Strong tokens (a terminal, gtk-launch, webbrowser) mean the script
+    exists to open UI: always flag. Weak tokens (xdg-open, nohup...)
+    also appear in scripts that open a browser for convenience yet
+    stay resident via exec/wait: flag those only when no foreground
+    sign is present. Bounded read; binaries are skipped. Returns the
+    token found, or None.
+    """
+    for token in argv or []:
+        path = os.path.expanduser(token)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "rb") as fh:
+                raw = fh.read(65536)
+        except OSError:
+            continue
+        if b"\x00" in raw[:4096]:
+            continue  # binary (interpreter etc.), not a script
+        body = raw.decode("utf-8", errors="replace")
+        for needle in SCRIPT_WRAPPER_STRONG:
+            if needle in body:
+                return "%s (in script)" % needle
+        if FOREGROUND_SIGN_RE.search(body):
+            return None
+        for needle in SCRIPT_WRAPPER_WEAK:
+            if needle in body:
+                return "%s (in script)" % needle
+        return None
+    return None
+
+
 
 APP_ID_SLUG_RE = re.compile(r"[^a-z0-9]+")
 
@@ -217,7 +265,7 @@ def app_to_service_prefill(app, registry_names=None):
         "workdir": app.get("workdir") or "",
         "url": "" if url == "-" else url,
         "conflict": bool(name) and name in registry_names,
-        "wrapper": launcher_wrapper_token(argv),
+        "wrapper": launcher_wrapper_token(argv) or script_wrapper_token(argv),
     }
 
 
@@ -265,7 +313,7 @@ def parse_desktop_file(path):
         "workdir": values.get("Path") or "",
         "file": str(path),
         "id_suggestion": launcher_id_suggestion(stem),
-        "wrapper": launcher_wrapper_token(argv),
+        "wrapper": launcher_wrapper_token(argv) or script_wrapper_token(argv),
     }
 
 
