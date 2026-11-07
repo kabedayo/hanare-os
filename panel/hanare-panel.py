@@ -261,7 +261,7 @@ def upsert_service(form):
     url = (form.get("url") or "").strip() or "-"
     gpu_keyword = (form.get("gpu_keyword") or "").strip() or "-"
     if not SERVICE_ID_RE.match(name):
-        return False, "IDは半角小文字・数字・ハイフン（先頭は英数字）で入力してください"
+        return False, "サービス名は半角小文字・数字・ハイフン（先頭は英数字）で入力してください"
     try:
         port = int(form.get("port") or "")
     except (TypeError, ValueError):
@@ -703,7 +703,7 @@ def build_window(app):
         return entry
 
     svc_entries = {
-        "name": labeled_entry("ID", settings_card),
+        "name": labeled_entry("サービス名（英小文字）", settings_card),
         "display": labeled_entry("表示名", settings_card),
         "port": labeled_entry("ポート", settings_card),
         "exec": labeled_entry("起動コマンド", settings_card),
