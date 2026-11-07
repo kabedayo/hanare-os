@@ -21,6 +21,12 @@ No more humans and AI fighting over the same desktop, the same GPU, and the same
   - a local web dashboard on `127.0.0.1:8790`.
 - **Manage** — start / stop / restart the LLM core and the image service as systemd user units; switch the LLM by editing one registry row; launch your local AI apps from the panel or dashboard.
 
+## Adding a service
+
+Services live in one registry (`services/services.tsv`) — you never edit code to add one. Open the panel's **Service settings (registry)** card, fill in the form (picking a desktop icon fills in the launch command, and the URL is derived from the port), or drag an app from the panel's app list onto the services card. Saving generates the systemd unit for you, and the new entry appears in the top bar, the panel and the dashboard. Dragging a service back onto the apps card demotes it to a plain app again.
+
+![How to register a service](docs/service-registration.png)
+
 ## Layers (the honest version)
 
 | Layer | What | State |
